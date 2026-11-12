@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash, createHmac, generateKeyPairSync, sign } from 'node:crypto'
 import test from 'node:test'
-import worker, { completeUpload, constantTimeEqual, createR2PresignedPutUrl, isValidEmail, normalizedBrevoEvent, parseCsv, renderTemplate } from './worker.js'
-import { authenticate } from './verify.js'
+import worker, { authenticate, completeUpload, constantTimeEqual, createR2PresignedPutUrl, isValidEmail, normalizedBrevoEvent, parseCsv, renderTemplate } from './worker.js'
 
 const { publicKey, privateKey } = generateKeyPairSync('ed25519')
 const { privateKey: otherPrivateKey } = generateKeyPairSync('ed25519')
