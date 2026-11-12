@@ -1,0 +1,21 @@
+# Kluzar Outreach
+
+Kluzar Outreach is a workspace for managing email outreach campaigns, lead lists, conditional follow-up sequences, sender accounts, and replies.
+
+The service is designed for customers to connect a mailbox they control. Kluzar does not provide customer mailboxes. A Kluzar sender is available for fallback and test messages.
+
+The product includes CSV lead imports, workspace-scoped records, unsubscribe and bounce suppression, stop-on-reply sequences, campaign event tracking, and test mode that sends only to the user's own address.
+
+The offer is free for a limited time. This build has no checkout and no paid plans.
+
+Public pages:
+- https://outreach.kluzar.com/
+- https://outreach.kluzar.com/features/
+- https://outreach.kluzar.com/pricing/
+- https://outreach.kluzar.com/faq/
+- https://outreach.kluzar.com/blog/
+- https://outreach.kluzar.com/privacy/
+- https://outreach.kluzar.com/terms/
+
+Contact: https://contact.kluzar.com
+Support: https://support.kluzar.com
