@@ -1,0 +1,21 @@
+name = "outreach-api"
+main = "worker.js"
+compatibility_date = "2026-10-28"
+workers_dev = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kluzar-outreach"
+database_id = "SET_D1_DATABASE_ID"
+
+[[d1_databases]]
+binding = "ACCOUNTS_DB"
+database_name = "kluzar-accounts"
+database_id = "SET_ACCOUNTS_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "kluzar-outreach-files"
+
+[triggers]
+crons = ["*/1 * * * *"]

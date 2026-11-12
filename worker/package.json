@@ -1,0 +1,9 @@
+{
+  "name": "kluzar-outreach-api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check worker.js",
+    "test": "node --test"
+  }
+}
