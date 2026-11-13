@@ -2277,11 +2277,11 @@ async function exchangeOAuth(request, env, provider, session, origin) {
     'SELECT state, user_id, workspace_id, provider, verifier, nonce, expires_at FROM oauth_states WHERE state = ?',
   ).bind(body.state).first()
   if (!state || state.provider !== provider || state.user_id !== session.userId || state.expires_at < Date.now()) {
-    return errorResponse('Mailbox connection could not be verified.', 400, origin)
+    return errorResponse('The connection request expired or was already used. Please try connecting again.', 400, origin)
   }
   const consumed = await env.DB.prepare('DELETE FROM oauth_states WHERE state = ? AND user_id = ? RETURNING state')
     .bind(body.state, session.userId).first()
-  if (!consumed) return errorResponse('Mailbox connection could not be verified.', 400, origin)
+  if (!consumed) return errorResponse('The connection request expired or was already used. Please try connecting again.', 400, origin)
   const clientId = provider === 'google' ? env.GOOGLE_OAUTH_CLIENT_ID : env.MICROSOFT_OAUTH_CLIENT_ID
   const clientSecret = provider === 'google' ? env.GOOGLE_OAUTH_CLIENT_SECRET : env.MICROSOFT_OAUTH_CLIENT_SECRET
   if (!clientId || !clientSecret) return errorResponse('Mailbox connection is not configured yet.', 503, origin)
@@ -2307,23 +2307,32 @@ async function exchangeOAuth(request, env, provider, session, origin) {
       signal: AbortSignal.timeout(10000),
     })
   } catch {
-    return errorResponse('Mailbox connection could not be completed.', 502, origin)
+    return errorResponse('The mailbox provider could not be reached. Please try again.', 502, origin)
   }
-  if (!tokenResponse.ok) return errorResponse('Mailbox connection could not be completed.', 400, origin)
+  if (!tokenResponse.ok) {
+    const providerError = await tokenResponse.json().catch(() => null)
+    const errorCode = isObject(providerError) && typeof providerError.error === 'string' ? providerError.error : ''
+    const allowedCodes = ['invalid_client', 'redirect_uri_mismatch', 'invalid_grant', 'unauthorized_client', 'unsupported_grant_type', 'invalid_request', 'access_denied']
+    const codeDetail = allowedCodes.includes(errorCode) ? ` (${errorCode})` : ''
+    return errorResponse(`The mailbox provider rejected the connection${codeDetail}. Please check the OAuth setup and try again.`, 400, origin)
+  }
   const tokens = await tokenResponse.json().catch(() => null)
-  if (!isObject(tokens) || typeof tokens.access_token !== 'string' || typeof tokens.refresh_token !== 'string') {
+  if (!isObject(tokens) || typeof tokens.access_token !== 'string') {
     return errorResponse('Mailbox did not grant the required access.', 400, origin)
+  }
+  if (typeof tokens.refresh_token !== 'string') {
+    return errorResponse(provider === 'google' ? 'Google did not return the access needed to stay connected. Please try again and allow all requested permissions.' : 'Microsoft did not return the access needed to stay connected. Please try again and allow all requested permissions.', 400, origin)
   }
   let address
   if (provider === 'google') {
     if (!String(tokens.scope ?? '').includes('gmail.send') || !String(tokens.scope ?? '').includes('gmail.readonly') || !tokens.id_token) {
-      return errorResponse('Mailbox did not grant the required access.', 400, origin)
+      return errorResponse('The mailbox did not grant the required access. Please allow sending and reading mail when Google asks.', 400, origin)
     }
     address = await googleIdentity(env, tokens.id_token, state.nonce)
   } else {
     const granted = String(tokens.scope ?? '')
     if (!granted.includes('Mail.Send') || !granted.includes('Mail.Read') || !tokens.id_token) {
-      return errorResponse('Mailbox did not grant the required access.', 400, origin)
+      return errorResponse('The mailbox did not grant the required access. Please allow sending and reading mail when Microsoft asks.', 400, origin)
     }
     address = await microsoftIdentity(env, tokens.id_token, state.nonce)
   }

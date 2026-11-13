@@ -1062,6 +1062,17 @@ function seedLead(overrides = {}) {
   }
 }
 
+test('creating a campaign without a sender succeeds as a draft', async () => {
+  const { env, db } = authedEnv({})
+  const result = await worker.fetch(authedRequest('POST', '/v1/campaigns', { workspaceId: 'ws-1', leadListId: 'list-1', senderId: null, name: 'No sender draft' }), env, { waitUntil() {} })
+  assert.equal(result.status, 201)
+  const payload = await result.json()
+  assert.equal(payload.data.status, 'draft')
+  assert.equal(payload.data.sender_id, null)
+  assert.equal(db.tables.campaigns.length, 1)
+  assert.equal(db.tables.campaigns[0].sender_id, null)
+})
+
 test('campaign scheduling validates the launch time and stores a scheduled launch', async () => {
   const seed = {
     campaigns: [seedCampaign()],
