@@ -11,6 +11,7 @@ export function TemplatesPage({
   onSaveTemplate,
   onDeleteTemplate,
   saving,
+  templatesUnavailable,
 }: {
   templates: EmailTemplate[]
   snippets: Snippet[]
@@ -19,6 +20,7 @@ export function TemplatesPage({
   onSaveTemplate: (draft: EmailTemplateDraft) => Promise<void>
   onDeleteTemplate?: (templateId: string) => Promise<void> | void
   saving?: boolean
+  templatesUnavailable?: boolean
 }) {
   const [editing, setEditing] = useState<EmailTemplate | null>(null)
   const [showDesigner, setShowDesigner] = useState(false)
@@ -66,7 +68,12 @@ export function TemplatesPage({
               </div>
               <span className="bento-pill">{templates.length} {templates.length === 1 ? 'template' : 'templates'}</span>
             </div>
-            {templates.length > 0 ? (
+            {templatesUnavailable ? (
+              <div className="bento-empty">
+                <p>The templates endpoint is not ready yet.</p>
+                <p>Saved templates could not be loaded because the templates endpoint is not answering yet. Nothing is shown here until it is — no template is lost, and no sample template is shown in its place.</p>
+              </div>
+            ) : templates.length > 0 ? (
               <div className="bento-list">
                 {templates.map((template) => (
                   <div className="bento-list-row" key={template.id}>

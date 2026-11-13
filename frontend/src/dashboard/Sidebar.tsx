@@ -17,6 +17,9 @@ const NAV_ITEMS: NavItem[] = [
 
 const NAV_ITEMS_LIBRARY: NavItem[] = [
   { title: 'Templates', href: '/dashboard/templates/', icon: 'grid' },
+  { title: 'Workflows', href: '/dashboard/workflows/', icon: 'list' },
+  { title: 'A/B testing', href: '/dashboard/ab-testing/', icon: 'flask' },
+  { title: 'DNS setup', href: '/dashboard/dns/', icon: 'check' },
   { title: 'Deliverability & Warm-up', href: '/dashboard/warmup/', icon: 'shield' },
   { title: 'Integrations', href: '/dashboard/integrations/', icon: 'link' },
   { title: 'Team', href: '/dashboard/team/', icon: 'team' },

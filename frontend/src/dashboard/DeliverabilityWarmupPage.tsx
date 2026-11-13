@@ -1,6 +1,6 @@
 import { DAILY_SEND_LIMIT, SEND_INTERVAL_SECONDS } from './api'
 import { BentoIcon } from './icons'
-import type { Sender } from './types'
+import type { Sender, WarmupState } from './types'
 
 const DELIVERABILITY_CARDS = [
   { number: '01', title: 'Authenticate your domain', body: 'SPF, DKIM and DMARC tell receiving mailboxes that your domain is allowed to send, that messages have not been altered, and what to do when a check fails. Set them up with your mailbox or domain provider — without them, even good mail can land in spam.' },
@@ -11,8 +11,10 @@ const DELIVERABILITY_CARDS = [
   { number: '06', title: 'Test before you launch', body: 'Send a test to your own email and read it the way a recipient would. Check the sender name, the subject, the links, and the plain-text rendering before anything reaches a real lead.' },
 ]
 
-export function DeliverabilityWarmupPage({ senders, suppressionCount }: { senders: Sender[]; suppressionCount: number }) {
+export function DeliverabilityWarmupPage({ senders, suppressionCount, warmup, onWarmupAction, warmupBusyId }: { senders: Sender[]; suppressionCount: number; warmup?: WarmupState[] | null; onWarmupAction?: (action: 'start' | 'pause' | 'resume', senderId: string) => void; warmupBusyId?: string | null }) {
   const monitored = senders.filter((sender) => sender.type === 'gmail_oauth' || sender.type === 'outlook_oauth')
+  const warmupBySender = new Map((warmup ?? []).map((state) => [state.senderId, state]))
+  const warmupLabel: Record<WarmupState['status'], string> = { not_started: 'Not started', ramping: 'Ramping up', paused: 'Paused', complete: 'Complete' }
 
   return (
     <div className="bento-page">
@@ -33,15 +35,31 @@ export function DeliverabilityWarmupPage({ senders, suppressionCount }: { sender
         </div>
         {senders.length > 0 ? (
           <div className="bento-list">
-            {senders.map((sender) => (
-              <div className="bento-list-row" key={sender.id}>
-                <div>
-                  <strong>{sender.address}</strong>
-                  <span>{sender.type === 'gmail_oauth' ? 'Gmail' : sender.type === 'outlook_oauth' ? 'Microsoft' : 'Kluzar sender · test mode only'}</span>
+            {senders.map((sender) => {
+              const state = warmupBySender.get(sender.id)
+              const cap = state ? Math.min(state.currentDailyCap, DAILY_SEND_LIMIT) : 0
+              const target = state ? Math.min(state.targetDailyCap, DAILY_SEND_LIMIT) : DAILY_SEND_LIMIT
+              const busy = warmupBusyId === sender.id
+              return (
+                <div className="bento-list-row" key={sender.id}>
+                  <div>
+                    <strong>{sender.address}</strong>
+                    <span>{sender.type === 'gmail_oauth' ? 'Gmail' : sender.type === 'outlook_oauth' ? 'Microsoft' : 'Kluzar sender · test mode only'}</span>
+                    {state && state.status !== 'not_started' && <span>{cap} of {target} per day{state.startedAt ? ` · started ${new Date(state.startedAt).toLocaleDateString()}` : ''}</span>}
+                  </div>
+                  <div className="bento-row-actions">
+                    <span className={state?.status === 'ramping' ? 'bento-badge running' : state?.status === 'complete' ? 'bento-badge running' : state?.status === 'paused' ? 'bento-badge paused' : 'bento-badge draft'}>{state ? warmupLabel[state.status] : 'Not started'}</span>
+                    {onWarmupAction && sender.type !== 'brevo_default' && (
+                      <>
+                        {(!state || state.status === 'not_started') && <button type="button" className="bento-text-btn" disabled={busy} onClick={() => onWarmupAction('start', sender.id)}>{busy ? 'Starting…' : 'Start warm-up'}</button>}
+                        {state?.status === 'ramping' && <button type="button" className="bento-text-btn" disabled={busy} onClick={() => onWarmupAction('pause', sender.id)}>{busy ? 'Pausing…' : 'Pause'}</button>}
+                        {state?.status === 'paused' && <button type="button" className="bento-text-btn" disabled={busy} onClick={() => onWarmupAction('resume', sender.id)}>{busy ? 'Resuming…' : 'Resume'}</button>}
+                      </>
+                    )}
+                  </div>
                 </div>
-                <span className="bento-badge draft">Not started</span>
-              </div>
-            ))}
+              )
+            })}
           </div>
         ) : (
           <div className="bento-empty">
@@ -57,7 +75,9 @@ export function DeliverabilityWarmupPage({ senders, suppressionCount }: { sender
         </div>
         <p className="bento-panel-foot">
           <BentoIcon name="flame" size={14} />
-          Warm-up ramps a mailbox’s daily volume gradually from a small start, instead of sending the full daily limit on day one. The warm-up schedule and per-mailbox progress need the warm-up endpoint described in the integration doc — no progress is shown here until it exists.
+          {warmup
+            ? 'Warm-up ramps a mailbox’s daily volume gradually from a small start, instead of sending the full daily limit on day one.'
+            : 'Warm-up ramps a mailbox’s daily volume gradually from a small start, instead of sending the full daily limit on day one. The live warm-up state is not available yet, so no progress is shown here until the warm-up endpoint answers.'}
         </p>
       </div>
 

@@ -206,7 +206,7 @@ export function EmailDesigner({
     setUploading(true)
     try {
       const uploaded = await uploadTemplateImage(file, workspaceId, csrfToken)
-      updateBlock(blockId, { src: uploaded.url, fileId: uploaded.id })
+      updateBlock(blockId, { src: uploaded.publicUrl, fileId: uploaded.id })
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Image upload failed.')
       setImageUrls((current) => {
@@ -353,13 +353,13 @@ export function EmailDesigner({
           )}
           {selected?.type === 'image' && (
             <div className="bento-inspector-fields">
-              <label>Upload image<input type="file" accept="image/png,image/jpeg" disabled={uploading} onChange={(event) => void handleImageFile(selected.id, event.target.files?.[0] ?? null)} /></label>
+              <label>Upload image<input type="file" accept="image/png,image/jpeg,image/gif" disabled={uploading} onChange={(event) => void handleImageFile(selected.id, event.target.files?.[0] ?? null)} /></label>
               {uploading && <p className="bento-designer-hint">Uploading image…</p>}
               <label>Or image URL<input value={selected.src} onChange={(event) => updateBlock(selected.id, { src: event.target.value, fileId: null })} placeholder="https://…" maxLength={500} /></label>
               <label>Alt text<input value={selected.alt} onChange={(event) => updateBlock(selected.id, { alt: event.target.value })} maxLength={200} placeholder="Describe the image" /></label>
               <label>Width<select value={selected.width} onChange={(event) => updateBlock(selected.id, { width: Number(event.target.value) })}><option value={25}>25%</option><option value={50}>50%</option><option value={75}>75%</option><option value={100}>100%</option></select></label>
               <label>Align<span className="bento-align-row">{(['left', 'center', 'right'] as const).map((align) => <button type="button" key={align} className={selected.align === align ? 'active' : ''} onClick={() => updateBlock(selected.id, { align })}>{align}</button>)}</span></label>
-              <p className="bento-designer-hint">Uploads go to your workspace’s private files (PNG or JPEG, up to 10 MB). Uploaded images are served to recipients from the template image link.</p>
+              <p className="bento-designer-hint">Uploads go to your workspace’s private files (PNG, JPEG or GIF, up to 10 MB). Uploaded images are served to recipients from the public template image link saved on the block, while the preview here uses your signed-in session.</p>
             </div>
           )}
           {selected?.type === 'button' && (

@@ -548,3 +548,81 @@ a.bento-step.later:hover .bento-step-row h3 { color: #18181b; }
 [data-theme="dark"] .dashboard-shell .dashboard-cards a { background: #1b1b40; border-color: #2c2c55; }
 [data-theme="dark"] .dashboard-shell .dashboard-cards h3 { color: #f0eefc; }
 [data-theme="dark"] .dashboard-shell .dashboard-cards p { color: #9c9bc0; }
+
+.bento-notice-success { background: #ecfdf5; border: 1px solid #d1fae5; color: #047857; padding: 12px 16px; border-radius: 8px; font-size: 13px; }
+.bento-form { display: grid; gap: 12px; padding: 0 20px 20px; }
+.bento-form-padded { padding-top: 4px; }
+.bento-form label, .bento-inline-label { display: grid; gap: 6px; font-size: 12px; font-weight: 600; color: #52525b; }
+.bento-form input, .bento-form select, .bento-form textarea, .bento-when-card select, .bento-when-card input, .bento-action-card select, .bento-action-card input, .bento-row-actions select { border: 1px solid #e4e4e7; border-radius: 8px; background: #fff; color: #18181b; font-size: 13px; padding: 9px 12px; outline: none; }
+.bento-form input:focus, .bento-form select:focus, .bento-form textarea:focus, .bento-when-card select:focus, .bento-when-card input:focus, .bento-action-card select:focus, .bento-action-card input:focus { border-color: #18181b; box-shadow: 0 0 0 1px #18181b; }
+.bento-form textarea { resize: vertical; line-height: 1.6; }
+.bento-form-hint { font-size: 12px; font-weight: 400; color: #71717a; }
+.bento-form input[type="range"] { padding: 0; border: 0; box-shadow: none; accent-color: #18181b; }
+.bento-row-actions select { padding: 6px 8px; font-size: 12px; }
+.bento-code { background: #fafafa; border: 1px solid #e4e4e7; border-radius: 8px; padding: 12px; font-size: 12px; line-height: 1.6; color: #18181b; white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; }
+.bento-dns-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 0 20px 20px; }
+.bento-dns-card { border: 1px solid #e4e4e7; border-radius: 12px; padding: 20px; background: #fff; }
+.bento-dns-card.pass { border-color: #d1fae5; }
+.bento-dns-card.fail { border-color: #ffe4e6; }
+.bento-dns-card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.bento-dns-card h3 { margin: 0; font-size: 14px; font-weight: 600; color: #18181b; }
+.bento-dns-card p { margin: 0 0 8px; font-size: 13px; line-height: 1.65; color: #71717a; }
+.bento-dns-expected-label { font-size: 12px; font-weight: 600; color: #52525b; }
+.bento-dns-unknown { color: #a1a1aa; }
+.bento-guidance { display: grid; gap: 12px; padding: 0 20px 20px; }
+.bento-guidance h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; color: #18181b; }
+.bento-guidance p { margin: 0; font-size: 13px; line-height: 1.65; color: #71717a; }
+.bento-flow { display: grid; gap: 16px; padding: 0 20px 20px; }
+.bento-rule { border: 1px solid #e4e4e7; border-radius: 12px; padding: 16px; display: grid; gap: 12px; background: #fff; }
+.bento-rule-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.bento-rule-number { font-size: 11px; font-weight: 700; color: #a1a1aa; text-transform: uppercase; letter-spacing: .08em; }
+.bento-when-card, .bento-action-card { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; border: 1px solid #e4e4e7; border-radius: 8px; padding: 12px; background: #fafafa; }
+.bento-when-card select, .bento-action-card select { flex: 1 1 200px; }
+.bento-when-card input, .bento-action-card input { flex: 1 1 160px; }
+.bento-flow-tag { font-size: 10px; font-weight: 700; color: #fff; background: #18181b; border-radius: 6px; padding: 4px 8px; letter-spacing: .08em; }
+.bento-action-card .bento-flow-tag { background: #52525b; }
+.bento-connector { display: flex; align-items: center; gap: 8px; padding-left: 12px; color: #a1a1aa; font-size: 12px; }
+.bento-connector em { font-style: normal; font-size: 10px; font-weight: 700; letter-spacing: .08em; color: #71717a; }
+.bento-inline-label { grid-template-columns: auto 1fr; align-items: center; }
+.bento-variant-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 0 20px 20px; }
+.bento-variant-card { border: 1px solid #e4e4e7; border-radius: 12px; padding: 20px; background: #fff; display: grid; gap: 10px; align-content: start; }
+.bento-variant-head { display: flex; justify-content: space-between; align-items: center; }
+.bento-variant-head h3 { margin: 0; font-size: 14px; font-weight: 600; color: #18181b; }
+.bento-variant-subject { margin: 0; font-size: 13px; font-weight: 600; color: #18181b; }
+.bento-variant-body { margin: 0; background: #fafafa; border: 1px solid #f4f4f5; border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.65; color: #3f3f46; white-space: pre-wrap; overflow-wrap: anywhere; }
+.bento-variant-note { margin: 0; font-size: 12px; color: #71717a; }
+.preview-html { margin-top: 12px; }
+.preview-html-frame { width: 100%; min-height: 320px; border: 1px solid #e4e4e7; border-radius: 8px; background: #fff; }
+@media (max-width: 1100px) {
+  .bento-dns-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .bento-variant-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 700px) {
+  .bento-dns-grid { grid-template-columns: minmax(0, 1fr); }
+}
+[data-theme="dark"] .bento-notice-success { background: #0f2e24; border-color: #14532d; color: #a7f3d0; }
+[data-theme="dark"] .bento-form label, [data-theme="dark"] .bento-inline-label { color: #b9b8d8; }
+[data-theme="dark"] .bento-form input, [data-theme="dark"] .bento-form select, [data-theme="dark"] .bento-form textarea, [data-theme="dark"] .bento-when-card select, [data-theme="dark"] .bento-when-card input, [data-theme="dark"] .bento-action-card select, [data-theme="dark"] .bento-action-card input, [data-theme="dark"] .bento-row-actions select { background: #23234c; border-color: #3a3a68; color: #e8e7f5; }
+[data-theme="dark"] .bento-form input:focus, [data-theme="dark"] .bento-form select:focus, [data-theme="dark"] .bento-form textarea:focus, [data-theme="dark"] .bento-when-card select:focus, [data-theme="dark"] .bento-when-card input:focus, [data-theme="dark"] .bento-action-card select:focus, [data-theme="dark"] .bento-action-card input:focus { border-color: #f0eefc; box-shadow: 0 0 0 1px #f0eefc; }
+[data-theme="dark"] .bento-form-hint { color: #9c9bc0; }
+[data-theme="dark"] .bento-code { background: #17173a; border-color: #2c2c55; color: #e8e7f5; }
+[data-theme="dark"] .bento-dns-card { background: #1b1b40; border-color: #2c2c55; }
+[data-theme="dark"] .bento-dns-card.pass { border-color: #14532d; }
+[data-theme="dark"] .bento-dns-card.fail { border-color: #5b2a3a; }
+[data-theme="dark"] .bento-dns-card h3 { color: #f0eefc; }
+[data-theme="dark"] .bento-dns-card p { color: #9c9bc0; }
+[data-theme="dark"] .bento-dns-expected-label { color: #b9b8d8; }
+[data-theme="dark"] .bento-guidance h3 { color: #f0eefc; }
+[data-theme="dark"] .bento-guidance p { color: #9c9bc0; }
+[data-theme="dark"] .bento-rule { background: #1b1b40; border-color: #2c2c55; }
+[data-theme="dark"] .bento-rule-number { color: #8a89b3; }
+[data-theme="dark"] .bento-when-card, [data-theme="dark"] .bento-action-card { background: #17173a; border-color: #2c2c55; }
+[data-theme="dark"] .bento-flow-tag { background: #f0eefc; color: #17173a; }
+[data-theme="dark"] .bento-action-card .bento-flow-tag { background: #3a3a68; color: #e8e7f5; }
+[data-theme="dark"] .bento-connector { color: #8a89b3; }
+[data-theme="dark"] .bento-connector em { color: #9c9bc0; }
+[data-theme="dark"] .bento-variant-card { background: #1b1b40; border-color: #2c2c55; }
+[data-theme="dark"] .bento-variant-head h3, [data-theme="dark"] .bento-variant-subject { color: #f0eefc; }
+[data-theme="dark"] .bento-variant-body { background: #17173a; border-color: #26264d; color: #d9d8ee; }
+[data-theme="dark"] .bento-variant-note { color: #9c9bc0; }
+[data-theme="dark"] .preview-html-frame { border-color: #2c2c55; background: #fff; }

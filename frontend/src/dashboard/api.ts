@@ -103,14 +103,14 @@ export async function fetchAnalyticsOverview(workspaceId: string, csrfToken: str
   return { analytics, campaigns, campaignStats, senders, suppressionCount: suppressions.length, onboarding, activity, notifications }
 }
 
-export type UploadedImage = { id: string; filename: string; sizeBytes: number; url: string }
+export type UploadedImage = { id: string; filename: string; sizeBytes: number; url: string; publicUrl: string }
 
 export async function uploadTemplateImage(file: File, workspaceId: string, csrfToken: string): Promise<UploadedImage> {
-  if (file.type !== 'image/png' && file.type !== 'image/jpeg') throw new Error('Only PNG and JPEG images are accepted.')
+  if (file.type !== 'image/png' && file.type !== 'image/jpeg' && file.type !== 'image/gif') throw new Error('Only PNG, JPEG and GIF images are accepted.')
   if (file.size < 1 || file.size > 10 * 1024 * 1024) throw new Error('Image must be smaller than 10 MB.')
   const upload = await fetchJson<{ uploadId: string; uploadUrl: string; headers: Record<string, string> }>('/files', csrfToken, {
     method: 'POST',
-    body: JSON.stringify({ workspaceId, filename: file.name, sizeBytes: file.size, contentType: file.type }),
+    body: JSON.stringify({ workspaceId, kind: 'template_image', filename: file.name, sizeBytes: file.size, contentType: file.type }),
   })
   const uploadResponse = await fetch(upload.uploadUrl, {
     method: 'PUT',
@@ -123,7 +123,11 @@ export async function uploadTemplateImage(file: File, workspaceId: string, csrfT
   })
   if (!uploadResponse.ok) throw new Error('Image upload could not be completed.')
   const completed = await fetchJson<{ id: string; filename: string; sizeBytes: number }>(`/files/${encodeURIComponent(upload.uploadId)}`, csrfToken, { method: 'POST' })
-  return { ...completed, url: `${API_BASE}/files/${encodeURIComponent(completed.id)}?workspaceId=${encodeURIComponent(workspaceId)}` }
+  return {
+    ...completed,
+    url: `${API_BASE}/files/${encodeURIComponent(completed.id)}?workspaceId=${encodeURIComponent(workspaceId)}`,
+    publicUrl: `https://outreach-api.kluzar.com/v1/images/${encodeURIComponent(completed.id)}`,
+  }
 }
 
 export async function fetchImageBlob(fileId: string, workspaceId: string, csrfToken: string): Promise<Blob> {

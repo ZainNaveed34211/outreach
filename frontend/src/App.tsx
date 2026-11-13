@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { clearAssertion, fetchAccountSession, getAssertion } from './lib/account'
-import { AnalyticsOverview, DashboardSidebar, DeliverabilityWarmupPage, IntegrationsPage, TeamPage, TemplatePicker, TemplatesPage } from './dashboard'
-import type { AnalyticsOverviewData, EmailTemplate, EmailTemplateDraft } from './dashboard'
+import { AnalyticsOverview, AbTestingPage, DashboardSidebar, DeliverabilityWarmupPage, DnsPage, IntegrationsPage, TeamPage, TemplatePicker, TemplatesPage, WorkflowsPage } from './dashboard'
+import type { AnalyticsOverviewData, EmailTemplate, EmailTemplateDraft, TeamInvite, TeamMember, WarmupState } from './dashboard'
 import { dashboardRequest, fetchAnalyticsOverview, fetchJson } from './dashboard/api'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'https://outreach-api.kluzar.com/v1'
@@ -17,11 +17,11 @@ type Lead = { id: string; email: string; first_name?: string; company?: string; 
 type LeadList = { id: string; name: string; lead_count: number }
 type Sender = { id: string; type: string; address: string; display_name: string; is_default: number; created_at: number }
 type Reply = { id: string; sender_email: string; subject: string; body_text: string; received_at: number; read_at?: number | null; lead_email: string; lead_id?: string; campaign_id?: string }
-type SequenceStep = { id: string; campaign_id: string; step_no: number; subject: string; delay_days: number }
+type SequenceStep = { id: string; campaign_id: string; step_no: number; subject: string; delay_days: number; body_html?: string | null; template_id?: string | null }
 type Notification = { id: string; message: string; created_at: number; read_at: number | null }
 type Snippet = { id: string; title: string; body: string; created_at: number }
 type Suppression = { id: string; email: string; reason: string; created_at: number }
-type PreviewStep = { step_no: number; delay_days: number; subject: string; body: string }
+type PreviewStep = { step_no: number; delay_days: number; subject: string; body: string; html?: string | null }
 type PreviewData = { campaign: { id: string; name: string }; lead: { id: string; email: string; first_name?: string | null; company?: string | null } | null; steps: PreviewStep[] }
 type PrelaunchData = { campaign: { id: string; name: string; status: string; scheduled_at?: number | null }; sender: { id: string; type: string; address: string } | null; senderReady: boolean; steps: number; hasFirstStep: boolean; totalInList: number; readyToSend: number; suppressedInList: number; excludedInList: number; variablesUsed: { first_name: boolean; company: boolean }; fieldsPresent: { first_name: boolean; company: boolean } }
 type TimelineEvent = { type: string; at: number; campaign_name?: string | null; sequence_step?: number | null }
@@ -707,6 +707,9 @@ const dashboardNav = [
   ['Sequences', '/dashboard/sequences/', '⌁'],
   ['Inbox', '/dashboard/inbox/', '↩'],
   ['Templates', '/dashboard/templates/', '▤'],
+  ['Workflows', '/dashboard/workflows/', '⌁'],
+  ['A/B testing', '/dashboard/ab-testing/', '⚗'],
+  ['DNS setup', '/dashboard/dns/', '✓'],
   ['Deliverability & Warm-up', '/dashboard/warmup/', '✓'],
   ['Integrations', '/dashboard/integrations/', '⧉'],
   ['Team', '/dashboard/team/', '◍'],
@@ -779,7 +782,14 @@ function DashboardPage({ path }: { path: string }) {
   const [suppressions, setSuppressions] = useState<Suppression[]>([])
   const [analyticsData, setAnalyticsData] = useState<AnalyticsOverviewData | null>(null)
   const [templates, setTemplates] = useState<EmailTemplate[]>([])
+  const [templatesUnavailable, setTemplatesUnavailable] = useState(false)
   const [savingTemplate, setSavingTemplate] = useState(false)
+  const [warmup, setWarmup] = useState<WarmupState[] | null>(null)
+  const [warmupBusyId, setWarmupBusyId] = useState<string | null>(null)
+  const [members, setMembers] = useState<TeamMember[] | null>(null)
+  const [invites, setInvites] = useState<TeamInvite[]>([])
+  const [membersUnavailable, setMembersUnavailable] = useState(false)
+  const [inviteResult, setInviteResult] = useState('')
   const [campaignTemplateId, setCampaignTemplateId] = useState<string | null>(null)
   const [campaignBodyHtml, setCampaignBodyHtml] = useState<string | null>(null)
   const [suppEmail, setSuppEmail] = useState('')
@@ -809,10 +819,83 @@ function DashboardPage({ path }: { path: string }) {
 
   const loadTemplates = async () => {
     try {
-      setTemplates(await fetchJson<EmailTemplate[]>(`/templates?workspaceId=${workspaceId}`, csrfToken))
+      const { response, payload } = await dashboardRequest<EmailTemplate[]>(`/templates?workspaceId=${workspaceId}`, {}, csrfToken)
+      if (response.status === 404 || response.status === 501) {
+        setTemplates([])
+        setTemplatesUnavailable(true)
+        return
+      }
+      if (!response.ok || payload.data === undefined) throw new Error(payload.error ?? 'Templates could not be loaded.')
+      setTemplates(payload.data)
+      setTemplatesUnavailable(false)
     } catch {
       setTemplates([])
+      setTemplatesUnavailable(true)
     }
+  }
+
+  const loadWarmup = async () => {
+    try {
+      setWarmup(await fetchJson<WarmupState[]>(`/warmup?workspaceId=${encodeURIComponent(workspaceId)}`, csrfToken))
+    } catch {
+      setWarmup(null)
+    }
+  }
+
+  const loadMembers = async () => {
+    try {
+      const rows = await fetchJson<TeamMember[]>(`/workspaces/${encodeURIComponent(workspaceId)}/members`, csrfToken)
+      setMembers(rows)
+      setMembersUnavailable(false)
+    } catch {
+      setMembers(null)
+      setMembersUnavailable(true)
+    }
+  }
+
+  const warmupAction = async (action: 'start' | 'pause' | 'resume', senderId: string) => {
+    setWarmupBusyId(senderId)
+    setError('')
+    try {
+      await fetchJson(`/warmup/${action}`, csrfToken, { method: 'POST', body: JSON.stringify({ workspaceId, senderId }) })
+      await loadWarmup()
+      setNotice(action === 'start' ? 'Warm-up started for this mailbox.' : action === 'pause' ? 'Warm-up paused for this mailbox.' : 'Warm-up resumed for this mailbox.')
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Warm-up could not be updated.')
+    } finally {
+      setWarmupBusyId(null)
+    }
+  }
+
+  const inviteMember = async (email: string, role: string) => {
+    const invite = await fetchJson<TeamInvite>(`/workspaces/${encodeURIComponent(workspaceId)}/invites`, csrfToken, {
+      method: 'POST',
+      body: JSON.stringify({ email, role }),
+    })
+    setInvites((current) => [invite, ...current])
+  }
+
+  const removeMember = async (userId: string) => {
+    const { response } = await dashboardRequest(`/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}`, { method: 'DELETE' }, csrfToken)
+    if (!response.ok) throw new Error('The member could not be removed.')
+    setMembers((current) => (current ?? []).filter((member) => member.userId !== userId))
+  }
+
+  const changeMemberRole = async (userId: string, role: string) => {
+    await fetchJson(`/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}`, csrfToken, {
+      method: 'PATCH',
+      body: JSON.stringify({ role }),
+    })
+    setMembers((current) => (current ?? []).map((member) => (member.userId === userId ? { ...member, role } : member)))
+  }
+
+  const acceptInvite = async (inviteId: string, token: string): Promise<string> => {
+    await fetchJson(`/workspaces/${encodeURIComponent(workspaceId)}/invites/${encodeURIComponent(inviteId)}/accept`, csrfToken, {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    })
+    await loadMembers()
+    return 'Invite accepted — welcome to the workspace.'
   }
 
   useEffect(() => {
@@ -893,8 +976,26 @@ function DashboardPage({ path }: { path: string }) {
   }, [section, workspaceId, csrfToken])
 
   useEffect(() => {
-    if ((section !== 'templates' && section !== 'campaigns') || !workspaceId) return
+    if (!['templates', 'campaigns', 'workflows', 'ab-testing'].includes(section) || !workspaceId) return
     loadTemplates()
+  }, [section, workspaceId, csrfToken])
+
+  useEffect(() => {
+    if (!workspaceId || (section !== 'warmup' && section !== 'deliverability')) {
+      setWarmup(null)
+      return
+    }
+    loadWarmup()
+  }, [section, workspaceId, csrfToken])
+
+  useEffect(() => {
+    if (!workspaceId || section !== 'team') {
+      setMembers(null)
+      setMembersUnavailable(false)
+      return
+    }
+    setInviteResult('')
+    loadMembers()
   }, [section, workspaceId, csrfToken])
 
   useEffect(() => {
@@ -1709,7 +1810,7 @@ function DashboardPage({ path }: { path: string }) {
             {showCampaignForm && <section className="table-panel form-panel"><div className="table-panel-header"><div><h2>New campaign</h2><p>Choose an audience and a mailbox that supports reply monitoring.</p></div></div>{!lists.length || !senders.some((sender) => sender.type === 'gmail_oauth' || sender.type === 'outlook_oauth') ? <p className="muted-copy">Create a lead list and connect Gmail or Microsoft before creating a sendable campaign. The Kluzar sender is test-only.</p> : <form onSubmit={createCampaign}><label htmlFor="campaign-name">Campaign name</label><input id="campaign-name" value={campaignName} onChange={(event) => setCampaignName(event.target.value)} maxLength={120} required /><label htmlFor="campaign-list">Lead list</label><select id="campaign-list" value={selectedListId} onChange={(event) => setSelectedListId(event.target.value)} required>{lists.map((list) => <option value={list.id} key={list.id}>{list.name} ({list.lead_count})</option>)}</select><label htmlFor="campaign-sender">Reply-monitored sender</label><select id="campaign-sender" value={selectedSenderId} onChange={(event) => setSelectedSenderId(event.target.value)} required>{senders.filter((sender) => sender.type === 'gmail_oauth' || sender.type === 'outlook_oauth').map((sender) => <option value={sender.id} key={sender.id}>{sender.address}</option>)}</select><label htmlFor="campaign-subject">First email subject</label><input id="campaign-subject" value={campaignSubject} onChange={(event) => setCampaignSubject(event.target.value)} maxLength={200} required /><TemplatePicker templates={templates} value={campaignTemplateId} onSelect={(template) => { setCampaignSubject((current) => current || template.subject); setCampaignBody(template.text); setCampaignTemplateId(template.id); setCampaignBodyHtml(template.html) }} /><label htmlFor="campaign-body">First email</label><textarea id="campaign-body" value={campaignBody} onChange={(event) => setCampaignBody(event.target.value)} maxLength={10000} required /><p className="form-hint">Available variables: {'{{first_name}}'}, {'{{company}}'}. Messages are sent as plain text.</p><label htmlFor="followup-subject">Optional follow-up subject</label><input id="followup-subject" value={followupSubject} onChange={(event) => setFollowupSubject(event.target.value)} maxLength={200} /><label htmlFor="followup-days">Follow-up delay in days</label><input id="followup-days" type="number" min="1" max="365" value={followupDelay} onChange={(event) => setFollowupDelay(event.target.value)} /><label htmlFor="followup-body">Optional follow-up message</label><textarea id="followup-body" value={followupBody} onChange={(event) => setFollowupBody(event.target.value)} maxLength={10000} /><button className="button button-primary" disabled={formBusy}>{formBusy ? 'Saving…' : 'Create draft'}</button></form>}</section>}
             <section className="table-panel"><div className="table-panel-header"><div><h2>Campaigns</h2><p>Production launch requires a reply-monitored mailbox. Sending is limited to 50 messages per workspace per day, with at least 60 seconds between sends.</p></div></div>
               <div className="filter-bar"><input aria-label="Search campaigns" type="search" placeholder="Search campaigns…" value={campaignQuery} onChange={(event) => setCampaignQuery(event.target.value)} /><select aria-label="Filter by status" value={campaignStatus} onChange={(event) => setCampaignStatus(event.target.value)}><option value="">All statuses</option><option value="draft">Draft</option><option value="scheduled">Scheduled</option><option value="active">Active</option><option value="paused">Paused</option><option value="done">Done</option><option value="archived">Archived</option></select><select aria-label="Sort campaigns" value={campaignSort} onChange={(event) => setCampaignSort(event.target.value)}><option value="created_desc">Newest first</option><option value="created_asc">Oldest first</option><option value="name_asc">Name A–Z</option><option value="name_desc">Name Z–A</option></select></div>
-              {preview && <div className="preview-panel"><div className="table-panel-header"><div><h2>Preview — {preview.campaign.name}</h2><p>Exactly what the lead will receive, with their details filled in.</p></div><button className="text-button" onClick={() => setPreview(null)}>Close preview</button></div>{previewLeads.length > 0 && <label className="preview-lead-select">Preview as<select value={previewLeadId} onChange={(event) => changePreviewLead(preview.campaign.id, event.target.value)}>{previewLeads.map((lead) => <option value={lead.id} key={lead.id}>{lead.email}{lead.first_name ? ` — ${lead.first_name}` : ''}</option>)}</select></label>}{preview.lead && <p className="muted-copy">Previewing with {preview.lead.email}{preview.lead.first_name ? ` (${preview.lead.first_name}${preview.lead.company ? `, ${preview.lead.company}` : ''})` : ''}.</p>}{preview.steps.length ? preview.steps.map((step) => <article className="preview-step" key={step.step_no}><span>Step {step.step_no}{step.delay_days > 0 ? ` · sent ${step.delay_days} days after the previous step` : ' · sent first'}</span><h3>{step.subject}</h3><pre>{step.body}</pre></article>) : <div className="compact-empty">This campaign has no message steps yet.</div>}</div>}
+              {preview && <div className="preview-panel"><div className="table-panel-header"><div><h2>Preview — {preview.campaign.name}</h2><p>Exactly what the lead will receive, with their details filled in.</p></div><button className="text-button" onClick={() => setPreview(null)}>Close preview</button></div>{previewLeads.length > 0 && <label className="preview-lead-select">Preview as<select value={previewLeadId} onChange={(event) => changePreviewLead(preview.campaign.id, event.target.value)}>{previewLeads.map((lead) => <option value={lead.id} key={lead.id}>{lead.email}{lead.first_name ? ` — ${lead.first_name}` : ''}</option>)}</select></label>}{preview.lead && <p className="muted-copy">Previewing with {preview.lead.email}{preview.lead.first_name ? ` (${preview.lead.first_name}${preview.lead.company ? `, ${preview.lead.company}` : ''})` : ''}.</p>}{preview.steps.length ? preview.steps.map((step) => <article className="preview-step" key={step.step_no}><span>Step {step.step_no}{step.delay_days > 0 ? ` · sent ${step.delay_days} days after the previous step` : ' · sent first'}</span><h3>{step.subject}</h3><pre>{step.body}</pre>{step.html && <div className="preview-html"><p className="form-hint">Designed version — how the email looks with its design applied.</p><iframe title={`Designed preview for step ${step.step_no}`} srcDoc={step.html} sandbox="" className="preview-html-frame" /></div>}</article>) : <div className="compact-empty">This campaign has no message steps yet.</div>}</div>}
               {prelaunch && <div className="preview-panel"><div className="table-panel-header"><div><h2>Pre-launch check — {prelaunch.campaign.name}</h2><p>Review the audience and the sender before anything is sent.</p></div><button className="text-button" onClick={() => setPrelaunch(null)}>Close check</button></div><ul className="check-summary">
                 <li className={prelaunch.senderReady ? 'ok' : 'warn'}><strong>{prelaunch.senderReady ? '✓' : '!'}</strong><span>Sender: {prelaunch.sender ? `${prelaunch.sender.address} (${prelaunch.sender.type === 'gmail_oauth' ? 'Gmail' : 'Microsoft'})` : 'no sender connected'}</span></li>
                 <li className={prelaunch.hasFirstStep ? 'ok' : 'warn'}><strong>{prelaunch.hasFirstStep ? '✓' : '!'}</strong><span>{prelaunch.steps} message step{prelaunch.steps === 1 ? '' : 's'}{prelaunch.hasFirstStep ? ', starting with step 1' : ' — a first step is required'}</span></li>
@@ -1739,7 +1840,7 @@ function DashboardPage({ path }: { path: string }) {
               {suppressions.length ? <div className="data-list">{suppressions.map((item) => <div className="lead-row" key={item.id}><div><strong>{item.email}</strong><span>{item.reason} · {new Date(item.created_at).toLocaleDateString()}</span></div><button className="text-button" onClick={() => removeSuppression(item)}>Remove suppression</button></div>)}</div> : <div className="compact-empty">No suppressed addresses in this workspace.</div>}
             </section>
           </>}
-          {workspaces.length > 0 && section === 'sequences' && <><section className="table-panel"><div className="table-panel-header"><div><h2>Sequence steps</h2><p>Follow-ups stop automatically when a reply is detected. Each step has a subject, a delay in days, and a message written by you.</p></div></div>{records.filter((record): record is SequenceStep => 'step_no' in record).length ? <div className="data-list">{records.filter((record): record is SequenceStep => 'step_no' in record).map((step) => <div key={step.id}><strong>Step {step.step_no}: {step.subject}</strong><span>Day {step.delay_days} · {step.campaign_id}</span><button className="text-button" onClick={() => cloneSequenceStep(step.id)}>Duplicate step</button></div>)}</div> : <div className="table-empty"><span className="empty-icon">⌁</span><h3>No sequence steps yet</h3><p>Create a campaign and add its first message. A sequence is the campaign\u2019s messages in order: the first message, then each follow-up after its delay. Keep the number of steps small and give each one a reason to exist.</p><a className="text-link" href="/dashboard/campaigns/">Go to campaigns <span aria-hidden="true">→</span></a></div>}</section>
+          {workspaces.length > 0 && section === 'sequences' && <><section className="table-panel"><div className="table-panel-header"><div><h2>Sequence steps</h2><p>Follow-ups stop automatically when a reply is detected. Each step has a subject, a delay in days, and a message written by you.</p></div></div>{records.filter((record): record is SequenceStep => 'step_no' in record).length ? <div className="data-list">{records.filter((record): record is SequenceStep => 'step_no' in record).map((step) => <div key={step.id}><strong>Step {step.step_no}: {step.subject}</strong>{(step.body_html || step.template_id) && <span className="status-pill">Designed email</span>}<span>Day {step.delay_days} · {step.campaign_id}</span><button className="text-button" onClick={() => cloneSequenceStep(step.id)}>Duplicate step</button></div>)}</div> : <div className="table-empty"><span className="empty-icon">⌁</span><h3>No sequence steps yet</h3><p>Create a campaign and add its first message. A sequence is the campaign\u2019s messages in order: the first message, then each follow-up after its delay. Keep the number of steps small and give each one a reason to exist.</p><a className="text-link" href="/dashboard/campaigns/">Go to campaigns <span aria-hidden="true">→</span></a></div>}</section>
             {records.filter((record): record is SequenceStep => 'step_no' in record).length > 0 && <section className="table-panel form-panel"><div className="table-panel-header"><div><h2>Add a conditional branch</h2><p>Branch rules are evaluated by the Worker scheduler.</p></div></div><form onSubmit={addBranch}><label htmlFor="branch-step">Sequence step</label><select id="branch-step" value={branchSequenceId} onChange={(event) => setBranchSequenceId(event.target.value)} required>{records.filter((record): record is SequenceStep => 'step_no' in record).map((step) => <option value={step.id} key={step.id}>Step {step.step_no}: {step.subject}</option>)}</select><label htmlFor="branch-condition">Condition</label><select id="branch-condition" value={branchCondition} onChange={(event) => setBranchCondition(event.target.value)}><option value="no_reply_after_days">No reply after a delay</option><option value="replied">A reply is detected</option></select>{branchCondition === 'no_reply_after_days' && <><label htmlFor="branch-days">Days without reply</label><input id="branch-days" type="number" min="1" max="365" value={branchConditionValue} onChange={(event) => setBranchConditionValue(event.target.value)} required /></>}<label htmlFor="branch-action">Action</label><select id="branch-action" value={branchAction} onChange={(event) => setBranchAction(event.target.value)}><option value="stop">Stop sequence</option><option value="send_followup">Send a follow-up step</option><option value="change_status">Change lead status</option><option value="notify">Notify workspace owner</option></select>{branchAction === 'change_status' && <select aria-label="New lead status" value={branchActionValue} onChange={(event) => setBranchActionValue(event.target.value)} required>{['contacted', 'replied', 'interested', 'not_interested', 'bounced', 'unsubscribed'].map((status) => <option value={status} key={status}>{status.replaceAll('_', ' ')}</option>)}</select>}{branchAction === 'send_followup' && <input aria-label="Follow-up step number (optional)" type="number" min="1" max="50" placeholder="Next step, or enter a step number" value={branchActionValue} onChange={(event) => setBranchActionValue(event.target.value)} />}<button className="button button-primary button-small" disabled={formBusy}>Save branch</button></form></section>}</>}
           {workspaces.length > 0 && section === 'inbox' && <section className="table-panel"><div className="table-panel-header"><div><h2>Replies</h2><p>Replies are detected by polling connected Gmail and Microsoft threads. When a reply arrives, the lead\u2019s active sequence stops.</p></div></div>
             <div className="filter-bar"><select aria-label="Filter replies by campaign" value={inboxCampaignFilter} onChange={(event) => setInboxCampaignFilter(event.target.value)}><option value="">All campaigns</option>{inboxCampaigns.map((campaign) => <option value={campaign.id} key={campaign.id}>{campaign.name}</option>)}</select><select aria-label="Filter replies by read state" value={inboxReadFilter} onChange={(event) => setInboxReadFilter(event.target.value)}><option value="">All replies</option><option value="unread">Unread</option><option value="read">Read</option></select></div>
@@ -1749,7 +1850,7 @@ function DashboardPage({ path }: { path: string }) {
             </article>)}</div> : <div className="table-empty"><span className="empty-icon">↩</span><h3>No replies detected</h3><p>Replies from monitored mailbox threads will appear here. Reply detection needs a connected Gmail or Microsoft mailbox — the Kluzar test sender cannot receive replies, so campaigns sent from it would never stop on reply. That is why production campaigns require your own mailbox.</p></div>}</section>}
           {workspaces.length > 0 && section === 'senders' && <><section className="table-panel"><div className="table-panel-header"><div><h2>Connected mailboxes</h2><p>Connected mailbox tokens are encrypted server-side. Read access is used only to detect replies on Outreach threads.</p></div></div>{records.filter((record): record is Sender => 'type' in record && 'address' in record).map((sender) => <div className="sender-row" key={sender.id}><div><strong>{sender.address}</strong><span>{sender.type === 'gmail_oauth' ? 'Gmail · reply monitoring enabled' : sender.type === 'outlook_oauth' ? 'Microsoft · reply monitoring enabled' : 'Kluzar sender · test mode only'}</span></div><span className="status-pill">{sender.type === 'brevo_default' ? 'Test only' : 'Connected'}</span></div>)}{!records.length && <div className="compact-empty">No senders connected yet. Connect a mailbox below to send production campaigns — or enable the Kluzar test sender to try test mode first.</div>}</section><section className="table-panel form-panel"><h2>Connect a mailbox</h2><p className="muted-copy">Production campaigns require Gmail or Microsoft OAuth so replies can stop follow-ups. Consent includes sending mail and reading mailbox threads for reply detection. You sign in with the mailbox provider — Kluzar Outreach never asks for your mailbox password, and tokens are encrypted server-side.</p><div className="row-actions"><button className="button button-outline button-small" disabled={formBusy || !workspaceId} onClick={() => connectMailbox('google')}>Connect Gmail</button><button className="button button-outline button-small" disabled={formBusy || !workspaceId} onClick={() => connectMailbox('microsoft')}>Connect Microsoft</button><button className="button button-primary button-small" disabled={formBusy || !workspaceId} onClick={addBrevoSender}>Enable Kluzar test sender</button></div><p className="form-hint">OAuth callback URLs: <code>https://outreach.kluzar.com/oauth/google/callback</code> and <code>https://outreach.kluzar.com/oauth/microsoft/callback</code>.</p><p className="form-hint">The Kluzar test sender is for tests only. It cannot receive replies, so a campaign sent from it could never stop on reply — that is why production campaigns need your own mailbox.</p></section><section className="table-panel"><h2>Domain management</h2><p className="muted-copy">Check SPF, DKIM, and DMARC status with your mailbox provider. This dashboard does not claim verification until a provider integration is configured. These three records tell receiving mailboxes that your domain is allowed to send, that messages have not been altered, and what to do when a check fails — without them, even good mail can land in spam.</p><a className="text-link" href={SUPPORT_URL}>Contact support <span aria-hidden="true">→</span></a></section></>}
           {workspaces.length > 0 && section === 'test' && <><section className="empty-panel test-panel"><span className="empty-icon">□</span><p className="eyebrow">SAFE TESTING</p><h2>Send a test only to yourself.</h2><p>Test messages go only to your verified Accounts email, never to workspace leads. Use test mode to read the message the way a recipient would — check the sender name, the subject, the links, and the plain-text rendering — before you launch anything.</p><p className="muted-copy">No mailbox is needed to test: the Kluzar sender handles test messages. To test a campaign draft, pick it from the list below; the test carries that draft\u2019s subject and message, sent only to you.</p><form onSubmit={sendTest}><label htmlFor="test-email">Your verified email</label><input id="test-email" type="email" autoComplete="email" value={testEmail} onChange={(event) => setTestEmail(event.target.value)} maxLength={254} required /><button className="button button-primary" disabled={formBusy || !ownEmail}>{formBusy ? 'Sending…' : 'Send test email'}</button></form><form onSubmit={sendCampaignTest}><label htmlFor="test-campaign">Test a campaign draft</label><select id="test-campaign" value={testCampaignId} onChange={(event) => setTestCampaignId(event.target.value)} required><option value="">Select a campaign</option>{records.filter((record): record is Campaign => 'name' in record && 'status' in record && 'lead_list_id' in record && record.status === 'draft').map((campaign) => <option value={campaign.id} key={campaign.id}>{campaign.name}</option>)}</select><button className="button button-outline" disabled={formBusy || !testCampaignId || !ownEmail}>Send campaign test</button></form></section></>}
-          {workspaces.length > 0 && !endpoint && !['overview', 'test', 'settings', 'templates', 'warmup', 'integrations', 'team', 'deliverability'].includes(section) && <section className="empty-panel"><h2>{activeTitle}</h2><p>This section will show items from your workspace when configured.</p></section>}
+          {workspaces.length > 0 && !endpoint && !['overview', 'test', 'settings', 'templates', 'warmup', 'integrations', 'team', 'deliverability', 'dns', 'workflows', 'ab-testing'].includes(section) && <section className="empty-panel"><h2>{activeTitle}</h2><p>This section will show items from your workspace when configured.</p></section>}
           {workspaces.length > 0 && section === 'settings' && <><section className="table-panel"><h2>Workspace settings</h2><p className="muted-copy">Your workspace is private to your account. Account identity and sign-in are managed by Kluzar Accounts. Campaigns, leads, replies and sender settings in this workspace are visible only to your account — another workspace cannot read them.</p><p className="muted-copy">Sending limits for this workspace: 50 messages per day, at least 60 seconds between sends. Suppression is checked before every send, and the Kluzar sender is available for tests only.</p><div className="row-actions"><a className="button button-outline button-small" href={accountUrl('login', `${window.location.origin}/dashboard/settings/`)}>Manage account</a><a className="button button-outline button-small" href={SUPPORT_URL}>Visit support</a><a className="button button-outline button-small" href={CONTACT_URL}>Contact Kluzar</a></div></section>
           <section className="table-panel"><div className="table-panel-header"><div><h2>Appearance</h2><p>Dark mode applies to the dashboard and is saved on this device.</p></div></div><label className="launch-confirm"><input type="checkbox" checked={darkMode} onChange={(event) => setDarkMode(event.target.checked)} /> Dark mode for the dashboard</label></section>
           <section className="table-panel"><div className="table-panel-header"><div><h2>Notifications</h2><p>Choose whether new replies also reach you by email. Replies always appear in the dashboard inbox.</p></div></div>{preferences ? <label className="launch-confirm"><input type="checkbox" checked={preferences.notifyReplyEmail} onChange={(event) => updateNotificationPreference(event.target.checked)} /> Email me when a lead replies</label> : <div className="compact-empty">Loading notification preferences…</div>}</section>
@@ -1766,16 +1867,38 @@ function DashboardPage({ path }: { path: string }) {
               onSaveTemplate={saveTemplate}
               onDeleteTemplate={deleteTemplate}
               saving={savingTemplate}
+              templatesUnavailable={templatesUnavailable}
             />
           )}
           {workspaces.length > 0 && (section === 'warmup' || section === 'deliverability') && (
-            <DeliverabilityWarmupPage senders={senders} suppressionCount={suppressions.length} />
+            <DeliverabilityWarmupPage senders={senders} suppressionCount={suppressions.length} warmup={warmup} onWarmupAction={(action, senderId) => void warmupAction(action, senderId)} warmupBusyId={warmupBusyId} />
           )}
           {workspaces.length > 0 && section === 'integrations' && (
             <IntegrationsPage senders={senders} />
           )}
           {workspaces.length > 0 && section === 'team' && (
-            <TeamPage ownerEmail={ownEmail} workspaceName={workspaces.find((w) => w.id === workspaceId)?.name ?? ''} />
+            <TeamPage
+              ownerEmail={ownEmail}
+              workspaceName={workspaces.find((w) => w.id === workspaceId)?.name ?? ''}
+              members={members}
+              invites={invites}
+              isOwner={(members ?? []).some((member) => member.email.toLowerCase() === ownEmail.toLowerCase() && member.role === 'owner')}
+              membersUnavailable={membersUnavailable}
+              inviteResult={inviteResult}
+              onInvite={inviteMember}
+              onRemoveMember={removeMember}
+              onChangeRole={changeMemberRole}
+              onAcceptInvite={acceptInvite}
+            />
+          )}
+          {workspaces.length > 0 && section === 'dns' && (
+            <DnsPage workspaceId={workspaceId} csrfToken={csrfToken} senderEmail={senders.find((sender) => sender.type === 'gmail_oauth' || sender.type === 'outlook_oauth')?.address ?? ownEmail} />
+          )}
+          {workspaces.length > 0 && section === 'workflows' && (
+            <WorkflowsPage workspaceId={workspaceId} csrfToken={csrfToken} lists={lists} templates={templates} />
+          )}
+          {workspaces.length > 0 && section === 'ab-testing' && (
+            <AbTestingPage workspaceId={workspaceId} csrfToken={csrfToken} templates={templates} />
           )}
         
         </section>

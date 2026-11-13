@@ -174,18 +174,40 @@ function escapeLike(value) {
 }
 
 async function queueCampaignSends(env, campaign, now) {
-  await env.DB.prepare(
-    `INSERT OR IGNORE INTO sends (id, campaign_id, lead_id, sequence_step, status, scheduled_at, created_at)
-     SELECT lower(hex(randomblob(16))), ?, l.id, 1, 'queued', ?, ?
-     FROM leads l JOIN lead_list_members m ON m.lead_id = l.id
-     WHERE l.workspace_id = ? AND m.list_id = ? AND l.status IN ('new', 'contacted')
-       AND NOT EXISTS (SELECT 1 FROM suppressions s WHERE s.workspace_id = l.workspace_id AND s.email = l.email)
-       AND NOT EXISTS (
-         SELECT 1 FROM sends active_send JOIN campaigns active_campaign ON active_campaign.id = active_send.campaign_id
-         WHERE active_send.lead_id = l.id AND active_campaign.workspace_id = l.workspace_id
-           AND active_campaign.status = 'active' AND active_send.status IN ('queued', 'sending')
-       )`,
-  ).bind(campaign.id, now, now, campaign.workspace_id, campaign.lead_list_id).run()
+  const test = await env.DB.prepare(
+    `SELECT t.id, t.split_percent, a.id AS variant_a_id, b.id AS variant_b_id
+     FROM ab_tests t JOIN ab_variants a ON a.ab_test_id = t.id AND a.label = 'A'
+     JOIN ab_variants b ON b.ab_test_id = t.id AND b.label = 'B'
+     WHERE t.campaign_id = ? AND t.status = 'running' ORDER BY t.created_at DESC LIMIT 1`,
+  ).bind(campaign.id).first()
+  if (!test) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO sends (id, campaign_id, lead_id, sequence_step, status, scheduled_at, created_at)
+       SELECT lower(hex(randomblob(16))), ?, l.id, 1, 'queued', ?, ?
+       FROM leads l JOIN lead_list_members m ON m.lead_id = l.id
+       WHERE l.workspace_id = ? AND m.list_id = ? AND l.status IN ('new', 'contacted')
+         AND NOT EXISTS (SELECT 1 FROM suppressions s WHERE s.workspace_id = l.workspace_id AND s.email = l.email)
+         AND NOT EXISTS (
+           SELECT 1 FROM sends active_send JOIN campaigns active_campaign ON active_campaign.id = active_send.campaign_id
+           WHERE active_send.lead_id = l.id AND active_campaign.workspace_id = l.workspace_id
+             AND active_campaign.status = 'active' AND active_send.status IN ('queued', 'sending')
+         )`,
+    ).bind(campaign.id, now, now, campaign.workspace_id, campaign.lead_list_id).run()
+    return
+  }
+  const leads = await campaignEligibleLeads(env, campaign)
+  const statements = []
+  for (const lead of leads) {
+    const hash = await sha256(lead.id)
+    const variantId = hash[0] < Number(test.split_percent) * 2.55 ? test.variant_a_id : test.variant_b_id
+    statements.push(env.DB.prepare(
+      `INSERT OR IGNORE INTO sends (id, campaign_id, lead_id, sequence_step, status, scheduled_at, created_at, ab_variant_id)
+       VALUES (?, ?, ?, 1, 'queued', ?, ?, ?)`,
+    ).bind(crypto.randomUUID(), campaign.id, lead.id, now, now, variantId))
+  }
+  for (let offset = 0; offset < statements.length; offset += 50) {
+    await env.DB.batch(statements.slice(offset, offset + 50))
+  }
 }
 
 async function campaignEligibleLeads(env, campaign) {
@@ -309,6 +331,39 @@ async function ownsWorkspace(env, workspaceId, userId) {
     'SELECT id FROM workspaces WHERE id = ? AND owner_user_id = ?',
   ).bind(workspaceId, userId).first()
   return Boolean(row)
+}
+
+async function canAccessWorkspace(env, workspaceId, userId) {
+  if (!safeText(workspaceId, 100)) return false
+  const row = await env.DB.prepare(
+    'SELECT id FROM workspaces WHERE id = ? AND (owner_user_id = ? OR EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = workspaces.id AND user_id = ?))',
+  ).bind(workspaceId, userId, userId).first()
+  return Boolean(row)
+}
+
+async function workspaceRole(env, workspaceId, userId) {
+  if (!safeText(workspaceId, 100)) return null
+  const row = await env.DB.prepare(
+    'SELECT id, owner_user_id FROM workspaces WHERE id = ?',
+  ).bind(workspaceId).first()
+  if (!row) return null
+  if (row.owner_user_id === userId) return 'owner'
+  const member = await env.DB.prepare(
+    'SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+  ).bind(workspaceId, userId).first()
+  return member ? member.role : null
+}
+
+function noContentResponse(origin) {
+  const headers = new Headers({
+    'Cache-Control': 'no-store',
+    'Vary': 'Origin',
+  })
+  if (origin === APP_ORIGIN) {
+    headers.set('Access-Control-Allow-Origin', APP_ORIGIN)
+    headers.set('Access-Control-Allow-Credentials', 'true')
+  }
+  return new Response(null, { status: 204, headers })
 }
 
 async function workspaceRecord(env, workspaceId, userId) {
@@ -458,6 +513,10 @@ export default {
     if (webhookMatch && request.method === 'POST') return brevoWebhook(request, env, webhookMatch[1])
     if (path.startsWith('/v1/webhooks/')) return errorResponse('Request could not be verified.', 401)
 
+    const imageMatch = path.match(/^\/v1\/images\/([A-Za-z0-9_-]+)$/)
+    if (imageMatch && request.method === 'GET') return servePublicImage(env, imageMatch[1])
+    if (path.startsWith('/v1/images/')) return errorResponse('Not found.', 404)
+
     if (origin !== APP_ORIGIN) return errorResponse('Request could not be verified.', 403)
     if (!path.startsWith('/v1/')) return errorResponse('Not found.', 404, origin)
     if (!['GET', 'POST', 'PATCH', 'DELETE'].includes(request.method)) return errorResponse('Method not allowed.', 405, origin)
@@ -486,8 +545,12 @@ async function routeApi(request, env, ctx, url, session, origin) {
   const method = request.method
   if (path === '/v1/me' && method === 'GET') {
     const workspaces = await env.DB.prepare(
-      'SELECT id, name, created_at FROM workspaces WHERE owner_user_id = ? ORDER BY created_at',
-    ).bind(session.userId).all()
+      `SELECT id, name, created_at, 'owner' AS role FROM workspaces WHERE owner_user_id = ?
+       UNION ALL
+       SELECT w.id, w.name, w.created_at, m.role AS role FROM workspaces w
+       JOIN workspace_members m ON m.workspace_id = w.id WHERE m.user_id = ?
+       ORDER BY created_at`,
+    ).bind(session.userId, session.userId).all()
     return jsonResponse({
       user: { id: session.userId, email: session.email || null },
       workspaces: workspaces.results ?? [],
@@ -495,8 +558,12 @@ async function routeApi(request, env, ctx, url, session, origin) {
   }
   if (path === '/v1/workspaces' && method === 'GET') {
     const rows = await env.DB.prepare(
-      'SELECT id, name, created_at FROM workspaces WHERE owner_user_id = ? ORDER BY created_at',
-    ).bind(session.userId).all()
+      `SELECT id, name, created_at, 'owner' AS role FROM workspaces WHERE owner_user_id = ?
+       UNION ALL
+       SELECT w.id, w.name, w.created_at, m.role AS role FROM workspaces w
+       JOIN workspace_members m ON m.workspace_id = w.id WHERE m.user_id = ?
+       ORDER BY created_at`,
+    ).bind(session.userId, session.userId).all()
     return jsonResponse(rows.results ?? [], origin)
   }
   if (path === '/v1/workspaces' && method === 'POST') return createWorkspace(request, env, session, origin)
@@ -573,6 +640,40 @@ async function routeApi(request, env, ctx, url, session, origin) {
   if (statsMatch && method === 'GET') return campaignStats(env, statsMatch[1], url, session, origin)
   if (path === '/v1/test/send' && method === 'POST') return sendTest(request, env, session, origin)
   if (path === '/v1/test/campaign' && method === 'POST') return testCampaign(request, env, session, origin)
+  if (path === '/v1/analytics' && method === 'GET') return getAnalytics(env, url, session, origin)
+  if (path === '/v1/templates' && method === 'GET') return listTemplates(env, url, session, origin)
+  if (path === '/v1/templates' && method === 'POST') return createTemplate(request, env, session, origin)
+  const templateMatch = path.match(/^\/v1\/templates\/([A-Za-z0-9_-]+)$/)
+  if (templateMatch && method === 'GET') return getTemplate(env, templateMatch[1], url, session, origin)
+  if (templateMatch && method === 'PATCH') return updateTemplate(request, env, templateMatch[1], url, session, origin)
+  if (templateMatch && method === 'DELETE') return deleteTemplate(env, templateMatch[1], url, session, origin)
+  if (path === '/v1/warmup' && method === 'GET') return getWarmup(env, url, session, origin)
+  const warmupAction = path.match(/^\/v1\/warmup\/(start|pause|resume)$/)
+  if (warmupAction && method === 'POST') return warmupActionResponse(request, env, warmupAction[1], session, origin)
+  const membersMatch = path.match(/^\/v1\/workspaces\/([A-Za-z0-9_-]+)\/members$/)
+  if (membersMatch && method === 'GET') return listMembers(env, membersMatch[1], session, origin)
+  const inviteMatch = path.match(/^\/v1\/workspaces\/([A-Za-z0-9_-]+)\/invites$/)
+  if (inviteMatch && method === 'POST') return createInvite(request, env, inviteMatch[1], session, origin)
+  const inviteAcceptMatch = path.match(/^\/v1\/workspaces\/([A-Za-z0-9_-]+)\/invites\/([A-Za-z0-9_-]+)\/accept$/)
+  if (inviteAcceptMatch && method === 'POST') return acceptInvite(request, env, inviteAcceptMatch[1], inviteAcceptMatch[2], session, origin)
+  const memberMatch = path.match(/^\/v1\/workspaces\/([A-Za-z0-9_-]+)\/members\/([A-Za-z0-9_-]+)$/)
+  if (memberMatch && method === 'PATCH') return updateMember(request, env, memberMatch[1], memberMatch[2], session, origin)
+  if (memberMatch && method === 'DELETE') return removeMember(env, memberMatch[1], memberMatch[2], session, origin)
+  if (path === '/v1/dns' && method === 'GET') return getDns(env, url, session, origin)
+  if (path === '/v1/workflows' && method === 'GET') return listWorkflows(env, url, session, origin)
+  if (path === '/v1/workflows' && method === 'POST') return createWorkflow(request, env, session, origin)
+  const workflowMatch = path.match(/^\/v1\/workflows\/([A-Za-z0-9_-]+)$/)
+  if (workflowMatch && method === 'GET') return getWorkflow(env, workflowMatch[1], url, session, origin)
+  if (workflowMatch && method === 'PATCH') return updateWorkflow(request, env, workflowMatch[1], session, origin)
+  if (workflowMatch && method === 'DELETE') return deleteWorkflow(env, workflowMatch[1], session, origin)
+  if (path === '/v1/ab-tests' && method === 'GET') return listAbTests(env, url, session, origin)
+  if (path === '/v1/ab-tests' && method === 'POST') return createAbTest(request, env, session, origin)
+  const abStatsMatch = path.match(/^\/v1\/ab-tests\/([A-Za-z0-9_-]+)\/stats$/)
+  if (abStatsMatch && method === 'GET') return getAbTestStats(env, abStatsMatch[1], session, origin)
+  const abTestMatch = path.match(/^\/v1\/ab-tests\/([A-Za-z0-9_-]+)$/)
+  if (abTestMatch && method === 'GET') return getAbTest(env, abTestMatch[1], url, session, origin)
+  if (abTestMatch && method === 'PATCH') return updateAbTest(request, env, abTestMatch[1], session, origin)
+  if (abTestMatch && method === 'DELETE') return deleteAbTest(env, abTestMatch[1], session, origin)
   if (path === '/v1/files' && method === 'POST') return uploadAttachment(request, env, session, origin)
   const fileMatch = path.match(/^\/v1\/files\/([A-Za-z0-9_-]+)$/)
   if (fileMatch && method === 'POST') return completeUpload(env, fileMatch[1], session, origin, 'attachment')
@@ -603,7 +704,7 @@ async function createWorkspace(request, env, session, origin) {
 
 async function listLeadLists(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const query = (url.searchParams.get('q') ?? '').trim().slice(0, 100)
   const sort = url.searchParams.get('sort') ?? 'created_desc'
   const orderBy = sort === 'created_asc'
@@ -640,7 +741,7 @@ async function createLeadList(request, env, session, origin) {
 
 async function listCampaigns(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const query = (url.searchParams.get('q') ?? '').trim().slice(0, 100)
   const status = url.searchParams.get('status') ?? ''
   const validStatuses = new Set(['draft', 'active', 'paused', 'done', 'scheduled', 'archived'])
@@ -692,11 +793,11 @@ async function getCampaign(env, campaignId, url, session, origin) {
   const campaign = await env.DB.prepare(
     `SELECT c.id, c.workspace_id, c.name, c.sender_id, c.lead_list_id, c.status, c.scheduled_at, c.created_at
      FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id
-     WHERE c.id = ? AND w.owner_user_id = ? AND (? IS NULL OR c.workspace_id = ?)`,
-  ).bind(campaignId, session.userId, workspaceId, workspaceId).first()
+     WHERE c.id = ? AND (? IS NULL OR c.workspace_id = ?) AND (w.owner_user_id = ? OR EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = w.id AND user_id = ?))`,
+  ).bind(campaignId, workspaceId, workspaceId, session.userId, session.userId).first()
   if (!campaign) return errorResponse('Campaign not found.', 404, origin)
   const steps = await env.DB.prepare(
-    'SELECT id, step_no, delay_days, subject, body_template, created_at FROM sequences WHERE campaign_id = ? ORDER BY step_no',
+    'SELECT id, step_no, delay_days, subject, body_template, body_html, template_id, created_at FROM sequences WHERE campaign_id = ? ORDER BY step_no',
   ).bind(campaignId).all()
   return jsonResponse({ ...campaign, sequence: steps.results ?? [] }, origin)
 }
@@ -752,7 +853,7 @@ async function campaignActionResponse(request, env, campaignId, action, session,
 
 async function listLeads(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const listId = url.searchParams.get('listId')
   if (listId) {
     const list = await env.DB.prepare('SELECT id FROM lead_lists WHERE id = ? AND workspace_id = ?')
@@ -993,7 +1094,7 @@ async function completeUpload(env, uploadId, session, origin, expectedKind) {
      FROM upload_intents i JOIN workspaces w ON w.id = i.workspace_id
      WHERE i.id = ? AND w.owner_user_id = ?`,
   ).bind(uploadId, session.userId).first()
-  if (!intent || intent.kind !== expectedKind) return errorResponse('Upload not found.', 404, origin)
+  if (!intent || (intent.kind !== expectedKind && !(expectedKind === 'attachment' && intent.kind === 'template_image'))) return errorResponse('Upload not found.', 404, origin)
   if (intent.completed_at && intent.result_json) return jsonResponse(JSON.parse(intent.result_json), origin)
   if (intent.expires_at < Date.now()) return errorResponse('Upload has expired. Please start again.', 410, origin)
 
@@ -1034,19 +1135,23 @@ async function completeUpload(env, uploadId, session, origin, expectedKind) {
       ['application/pdf', { extension: '.pdf', prefix: [0x25, 0x50, 0x44, 0x46, 0x2d] }],
       ['image/png', { extension: '.png', prefix: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] }],
       ['image/jpeg', { extension: '.jpg', prefix: [0xff, 0xd8, 0xff] }],
+      ['image/gif', { extension: '.gif', prefix: [0x47, 0x49, 0x46, 0x38] }],
     ])
     const type = permitted.get(intent.content_type.toLowerCase())
     const filename = intent.filename.replace(/[\u0000-\u001f\u007f]/g, '_').slice(0, 255)
-    if (!type || !filename.toLowerCase().endsWith(type.extension)) {
+    const imageOnly = intent.kind === 'template_image'
+    if (!type || (imageOnly && type.extension === '.pdf') || !filename.toLowerCase().endsWith(type.extension)) {
       await env.FILES.delete(intent.r2_key)
-      return errorResponse('Only PDF, PNG, and JPEG attachments are accepted.', 415, origin)
+      return errorResponse(imageOnly ? 'Only PNG, JPEG, and GIF template images are accepted.' : 'Only PDF, PNG, JPEG, and GIF attachments are accepted.', 415, origin)
     }
     const prefix = objectBytes.subarray(0, type.prefix.length)
     if (!type.prefix.every((byte, index) => prefix[index] === byte)) {
       await env.FILES.delete(intent.r2_key)
       return errorResponse('Attachment content does not match its file type.', 415, origin)
     }
-    finalKey = `${intent.workspace_id}/attachments/${intent.id}${type.extension}`
+    finalKey = imageOnly
+      ? `${intent.workspace_id}/templates/${intent.id}${type.extension}`
+      : `${intent.workspace_id}/attachments/${intent.id}${type.extension}`
     result = { id: intent.id, filename, sizeBytes: object.size }
   }
 
@@ -1134,9 +1239,9 @@ async function cleanupExpiredUploads(env) {
 
 async function listSequences(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const rows = await env.DB.prepare(
-    `SELECT s.id, s.campaign_id, s.step_no, s.delay_days, s.subject, s.body_template, s.created_at
+    `SELECT s.id, s.campaign_id, s.step_no, s.delay_days, s.subject, s.body_template, s.body_html, s.template_id, s.created_at
      FROM sequences s JOIN campaigns c ON c.id = s.campaign_id
      WHERE c.workspace_id = ? ORDER BY c.created_at DESC, s.step_no`,
   ).bind(workspaceId).all()
@@ -1154,15 +1259,17 @@ async function createSequence(request, env, session, origin) {
     !safeText(body.bodyTemplate, 10000)
   ) return errorResponse('Enter valid sequence step details.', 400, origin)
   const campaign = await env.DB.prepare(
-    `SELECT c.id FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id
+    `SELECT c.id, c.workspace_id FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id
      WHERE c.id = ? AND w.owner_user_id = ? AND c.status = 'draft'`,
   ).bind(body.campaignId, session.userId).first()
   if (!campaign) return errorResponse('Campaign not found or cannot be edited.', 404, origin)
+  const htmlResult = await resolveSequenceHtml(env, campaign.workspace_id, body)
+  if (htmlResult.error) return errorResponse(htmlResult.error, 400, origin)
   const id = crypto.randomUUID()
   await env.DB.prepare(
-    'INSERT INTO sequences (id, campaign_id, step_no, delay_days, subject, body_template, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-  ).bind(id, body.campaignId, body.stepNo, body.delayDays, body.subject.trim(), body.bodyTemplate, Date.now()).run()
-  return jsonResponse({ id, campaign_id: body.campaignId, step_no: body.stepNo, delay_days: body.delayDays }, origin, 201)
+    'INSERT INTO sequences (id, campaign_id, step_no, delay_days, subject, body_template, body_html, template_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  ).bind(id, body.campaignId, body.stepNo, body.delayDays, body.subject.trim(), body.bodyTemplate, htmlResult.html, htmlResult.templateId, Date.now()).run()
+  return jsonResponse({ id, campaign_id: body.campaignId, step_no: body.stepNo, delay_days: body.delayDays, body_html: htmlResult.html, template_id: htmlResult.templateId }, origin, 201)
 }
 
 async function updateSequence(request, env, sequenceId, session, origin) {
@@ -1170,20 +1277,38 @@ async function updateSequence(request, env, sequenceId, session, origin) {
   if (!isObject(body) || !safeText(body.subject, 200) || /[\r\n]/.test(body.subject) || !safeText(body.bodyTemplate, 10000) || !Number.isInteger(body.delayDays) || body.delayDays < 0 || body.delayDays > 365) {
     return errorResponse('Enter valid sequence step details.', 400, origin)
   }
-  const row = await env.DB.prepare(
-    `UPDATE sequences SET subject = ?, body_template = ?, delay_days = ?
-     WHERE id = ? AND campaign_id IN (
-       SELECT c.id FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id
-       WHERE w.owner_user_id = ? AND c.status = 'draft'
-     ) RETURNING id, campaign_id, step_no, delay_days, subject, body_template`,
-  ).bind(body.subject.trim(), body.bodyTemplate, body.delayDays, sequenceId, session.userId).first()
+  let htmlUpdate = null
+  if (body.templateId !== undefined || body.bodyHtml !== undefined) {
+    const step = await env.DB.prepare(
+      'SELECT c.workspace_id FROM sequences s JOIN campaigns c ON c.id = s.campaign_id WHERE s.id = ?',
+    ).bind(sequenceId).first()
+    if (!step) return errorResponse('Sequence step not found or cannot be edited.', 404, origin)
+    const htmlResult = await resolveSequenceHtml(env, step.workspace_id, body)
+    if (htmlResult.error) return errorResponse(htmlResult.error, 400, origin)
+    htmlUpdate = htmlResult
+  }
+  const row = htmlUpdate
+    ? await env.DB.prepare(
+      `UPDATE sequences SET subject = ?, body_template = ?, delay_days = ?, body_html = ?, template_id = ?
+       WHERE id = ? AND campaign_id IN (
+         SELECT c.id FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id
+         WHERE w.owner_user_id = ? AND c.status = 'draft'
+       ) RETURNING id, campaign_id, step_no, delay_days, subject, body_template, body_html, template_id`,
+    ).bind(body.subject.trim(), body.bodyTemplate, body.delayDays, htmlUpdate.html, htmlUpdate.templateId, sequenceId, session.userId).first()
+    : await env.DB.prepare(
+      `UPDATE sequences SET subject = ?, body_template = ?, delay_days = ?
+       WHERE id = ? AND campaign_id IN (
+         SELECT c.id FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id
+         WHERE w.owner_user_id = ? AND c.status = 'draft'
+       ) RETURNING id, campaign_id, step_no, delay_days, subject, body_template, body_html, template_id`,
+    ).bind(body.subject.trim(), body.bodyTemplate, body.delayDays, sequenceId, session.userId).first()
   if (!row) return errorResponse('Sequence step not found or cannot be edited.', 404, origin)
   return jsonResponse(row, origin)
 }
 
 async function listBranches(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const rows = await env.DB.prepare(
     `SELECT b.id, b.sequence_id, b.condition, b.condition_value, b.action, b.action_value, b.created_at
      FROM branches b JOIN sequences s ON s.id = b.sequence_id
@@ -1221,7 +1346,7 @@ async function createBranch(request, env, session, origin) {
 
 async function listSenders(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const rows = await env.DB.prepare(
     'SELECT id, workspace_id, type, address, display_name, is_default, created_at FROM senders WHERE workspace_id = ? ORDER BY created_at',
   ).bind(workspaceId).all()
@@ -1255,7 +1380,7 @@ async function createBrevoSender(request, env, session, origin) {
 
 async function listInbox(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const campaignId = url.searchParams.get('campaignId')
   if (campaignId) {
     const campaign = await env.DB.prepare('SELECT id FROM campaigns WHERE id = ? AND workspace_id = ?')
@@ -1280,7 +1405,7 @@ async function replyToInbox(request, env, replyId, session, origin) {
   if (!isObject(body) || !safeText(body.body, 10000) || !safeText(body.workspaceId, 100)) {
     return errorResponse('Enter a reply message.', 400, origin)
   }
-  if (!await ownsWorkspace(env, body.workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, body.workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const reply = await env.DB.prepare(
     `SELECT r.id, r.subject, s.campaign_id, s.lead_id, s.provider_message_id, s.provider_thread_id,
             l.email AS lead_email, l.status AS lead_status, c.workspace_id, c.sender_id,
@@ -1353,14 +1478,22 @@ async function markInboxRead(request, env, replyId, session, origin) {
     `UPDATE replies SET read_at = ?
      WHERE id = ? AND send_id IN (
        SELECT s.id FROM sends s JOIN campaigns c ON c.id = s.campaign_id
-       JOIN workspaces w ON w.id = c.workspace_id WHERE w.owner_user_id = ?
+       JOIN workspaces w ON w.id = c.workspace_id WHERE w.owner_user_id = ? OR EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = w.id AND user_id = ?)
      ) RETURNING id, read_at`,
-  ).bind(body.read ? now : null, replyId, session.userId).first()
+  ).bind(body.read ? now : null, replyId, session.userId, session.userId).first()
   if (!row) return errorResponse('Reply not found.', 404, origin)
   return jsonResponse(row, origin)
 }
 
 async function ownedCampaign(env, campaignId, session, workspaceId) {
+  return env.DB.prepare(
+    `SELECT c.id, c.workspace_id, c.name, c.sender_id, c.lead_list_id, c.status, c.scheduled_at, c.created_at
+     FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id
+     WHERE c.id = ? AND (? IS NULL OR c.workspace_id = ?) AND (w.owner_user_id = ? OR EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = w.id AND user_id = ?))`,
+  ).bind(campaignId, workspaceId, workspaceId, session.userId, session.userId).first()
+}
+
+async function ownerCampaign(env, campaignId, session, workspaceId) {
   return env.DB.prepare(
     `SELECT c.id, c.workspace_id, c.name, c.sender_id, c.lead_list_id, c.status, c.scheduled_at, c.created_at
      FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id
@@ -1373,7 +1506,7 @@ async function previewCampaign(env, campaignId, url, session, origin) {
   const campaign = await ownedCampaign(env, campaignId, session, workspaceId)
   if (!campaign) return errorResponse('Campaign not found.', 404, origin)
   const steps = await env.DB.prepare(
-    'SELECT step_no, delay_days, subject, body_template FROM sequences WHERE campaign_id = ? ORDER BY step_no',
+    'SELECT step_no, delay_days, subject, body_template, body_html, template_id FROM sequences WHERE campaign_id = ? ORDER BY step_no',
   ).bind(campaignId).all()
   let lead = null
   const leadId = url.searchParams.get('leadId')
@@ -1397,6 +1530,8 @@ async function previewCampaign(env, campaignId, url, session, origin) {
       delay_days: step.delay_days,
       subject: renderTemplate(step.subject, data),
       body: renderTemplate(step.body_template, data),
+      html: step.body_html ? renderTemplate(step.body_html, data) : null,
+      template_id: step.template_id ?? null,
     })),
   }, origin)
 }
@@ -1410,7 +1545,7 @@ async function prelaunchCheck(env, campaignId, url, session, origin) {
       .bind(campaign.sender_id, campaign.workspace_id).first()
     : null
   const steps = await env.DB.prepare(
-    'SELECT step_no, delay_days, subject, body_template FROM sequences WHERE campaign_id = ? ORDER BY step_no',
+    'SELECT step_no, delay_days, subject, body_template, body_html, template_id FROM sequences WHERE campaign_id = ? ORDER BY step_no',
   ).bind(campaignId).all()
   const stepRows = steps.results ?? []
   const eligible = await campaignEligibleLeads(env, campaign)
@@ -1455,10 +1590,10 @@ async function prelaunchCheck(env, campaignId, url, session, origin) {
 }
 
 async function cloneCampaign(env, campaignId, session, origin) {
-  const campaign = await ownedCampaign(env, campaignId, session, null)
+  const campaign = await ownerCampaign(env, campaignId, session, null)
   if (!campaign) return errorResponse('Campaign not found.', 404, origin)
   const steps = await env.DB.prepare(
-    'SELECT id, step_no, delay_days, subject, body_template FROM sequences WHERE campaign_id = ? ORDER BY step_no',
+    'SELECT id, step_no, delay_days, subject, body_template, body_html, template_id FROM sequences WHERE campaign_id = ? ORDER BY step_no',
   ).bind(campaignId).all()
   const branches = await env.DB.prepare(
     `SELECT b.id, b.sequence_id, b.condition, b.condition_value, b.action, b.action_value
@@ -1477,8 +1612,8 @@ async function cloneCampaign(env, campaignId, session, origin) {
     const newStepId = crypto.randomUUID()
     stepIdMap.set(step.id, newStepId)
     statements.push(env.DB.prepare(
-      'INSERT INTO sequences (id, campaign_id, step_no, delay_days, subject, body_template, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    ).bind(newStepId, newId, step.step_no, step.delay_days, step.subject, step.body_template, now))
+      'INSERT INTO sequences (id, campaign_id, step_no, delay_days, subject, body_template, body_html, template_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).bind(newStepId, newId, step.step_no, step.delay_days, step.subject, step.body_template, step.body_html ?? null, step.template_id ?? null, now))
   }
   for (const branch of branches.results ?? []) {
     const newStepId = stepIdMap.get(branch.sequence_id)
@@ -1494,7 +1629,7 @@ async function cloneCampaign(env, campaignId, session, origin) {
 
 async function cloneSequence(env, sequenceId, session, origin) {
   const step = await env.DB.prepare(
-    `SELECT s.id, s.campaign_id, s.step_no, s.delay_days, s.subject, s.body_template, c.workspace_id, c.status, c.name AS campaign_name
+    `SELECT s.id, s.campaign_id, s.step_no, s.delay_days, s.subject, s.body_template, s.body_html, s.template_id, c.workspace_id, c.status, c.name AS campaign_name
      FROM sequences s JOIN campaigns c ON c.id = s.campaign_id
      JOIN workspaces w ON w.id = c.workspace_id
      WHERE s.id = ? AND w.owner_user_id = ? AND c.status = 'draft'`,
@@ -1511,8 +1646,8 @@ async function cloneSequence(env, sequenceId, session, origin) {
   ).bind(sequenceId).all()
   const statements = [
     env.DB.prepare(
-      'INSERT INTO sequences (id, campaign_id, step_no, delay_days, subject, body_template, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    ).bind(newId, step.campaign_id, newStepNo, step.delay_days, step.subject, step.body_template, now),
+      'INSERT INTO sequences (id, campaign_id, step_no, delay_days, subject, body_template, body_html, template_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).bind(newId, step.campaign_id, newStepNo, step.delay_days, step.subject, step.body_template, step.body_html ?? null, step.template_id ?? null, now),
   ]
   for (const branch of branches.results ?? []) {
     statements.push(env.DB.prepare(
@@ -1520,7 +1655,7 @@ async function cloneSequence(env, sequenceId, session, origin) {
     ).bind(crypto.randomUUID(), newId, branch.condition, branch.condition_value, branch.action, branch.action_value, now))
   }
   await env.DB.batch(statements)
-  return jsonResponse({ id: newId, campaign_id: step.campaign_id, step_no: newStepNo, delay_days: step.delay_days, subject: step.subject, body_template: step.body_template }, origin, 201)
+  return jsonResponse({ id: newId, campaign_id: step.campaign_id, step_no: newStepNo, delay_days: step.delay_days, subject: step.subject, body_template: step.body_template, body_html: step.body_html ?? null, template_id: step.template_id ?? null }, origin, 201)
 }
 
 async function scheduleCampaign(request, env, campaignId, session, origin) {
@@ -1593,7 +1728,7 @@ async function launchScheduledCampaigns(env, now) {
 }
 
 async function archiveCampaign(env, campaignId, session, origin) {
-  const campaign = await ownedCampaign(env, campaignId, session, null)
+  const campaign = await ownerCampaign(env, campaignId, session, null)
   if (!campaign) return errorResponse('Campaign not found.', 404, origin)
   if (campaign.status === 'archived') return errorResponse('Campaign is already archived.', 409, origin)
   await env.DB.prepare("UPDATE campaigns SET status = 'archived' WHERE id = ?").bind(campaignId).run()
@@ -1602,7 +1737,7 @@ async function archiveCampaign(env, campaignId, session, origin) {
 }
 
 async function unarchiveCampaign(env, campaignId, session, origin) {
-  const campaign = await ownedCampaign(env, campaignId, session, null)
+  const campaign = await ownerCampaign(env, campaignId, session, null)
   if (!campaign) return errorResponse('Campaign not found.', 404, origin)
   if (campaign.status !== 'archived') return errorResponse('Campaign is not archived.', 409, origin)
   const sent = await env.DB.prepare('SELECT id FROM sends WHERE campaign_id = ? LIMIT 1').bind(campaignId).first()
@@ -1636,7 +1771,7 @@ function csvResponse(filename, body) {
 
 async function exportLeadList(env, listId, url, session) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, APP_ORIGIN)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, APP_ORIGIN)
   const list = await env.DB.prepare('SELECT id, name FROM lead_lists WHERE id = ? AND workspace_id = ?')
     .bind(listId, workspaceId).first()
   if (!list) return errorResponse('Lead list not found.', 404, APP_ORIGIN)
@@ -1763,7 +1898,7 @@ async function leadTimeline(env, leadId, url, session, origin) {
 
 async function listSuppressions(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const rows = await env.DB.prepare(
     'SELECT id, email, reason, created_at FROM suppressions WHERE workspace_id = ? ORDER BY created_at DESC LIMIT 500',
   ).bind(workspaceId).all()
@@ -1819,7 +1954,7 @@ async function removeSuppression(env, suppressionId, session, origin) {
 
 async function listSnippets(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const rows = await env.DB.prepare(
     'SELECT id, title, body, created_at FROM snippets WHERE workspace_id = ? ORDER BY created_at',
   ).bind(workspaceId).all()
@@ -1871,7 +2006,7 @@ async function deleteSnippet(env, snippetId, session, origin) {
 
 async function onboardingState(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const [sender, lead, campaign, test, launched] = await Promise.all([
     env.DB.prepare(
       "SELECT id FROM senders WHERE workspace_id = ? AND type IN ('gmail_oauth', 'outlook_oauth') LIMIT 1",
@@ -1896,7 +2031,7 @@ async function onboardingState(env, url, session, origin) {
 
 async function listActivity(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const rows = await env.DB.prepare(
     'SELECT id, type, message, created_at FROM activity_log WHERE workspace_id = ? ORDER BY created_at DESC LIMIT 100',
   ).bind(workspaceId).all()
@@ -1924,7 +2059,7 @@ async function updatePreferences(request, env, workspaceId, session, origin) {
 
 async function listNotifications(env, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
   const rows = await env.DB.prepare(
     'SELECT id, message, created_at, read_at FROM notifications WHERE workspace_id = ? ORDER BY created_at DESC LIMIT 100',
   ).bind(workspaceId).all()
@@ -1942,10 +2077,7 @@ async function markNotificationsRead(request, env, session, origin) {
 
 async function campaignStats(env, campaignId, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
-  const campaign = await env.DB.prepare(
-    `SELECT c.id FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id
-     WHERE c.id = ? AND w.owner_user_id = ? AND (? IS NULL OR c.workspace_id = ?)`,
-  ).bind(campaignId, session.userId, workspaceId, workspaceId).first()
+  const campaign = await ownedCampaign(env, campaignId, session, workspaceId)
   if (!campaign) return errorResponse('Campaign not found.', 404, origin)
   const result = await env.DB.prepare(
     `SELECT
@@ -2000,20 +2132,23 @@ async function uploadAttachment(request, env, session, origin) {
   ) {
     return errorResponse('Choose a valid workspace and attachment.', 400, origin)
   }
+  const kind = body.kind === undefined || body.kind === null ? 'attachment' : body.kind
+  if (kind !== 'attachment' && kind !== 'template_image') return errorResponse('Choose a valid file type.', 400, origin)
   const permitted = new Map([
     ['application/pdf', { extension: '.pdf', prefix: [0x25, 0x50, 0x44, 0x46, 0x2d] }],
     ['image/png', { extension: '.png', prefix: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] }],
     ['image/jpeg', { extension: '.jpg', prefix: [0xff, 0xd8, 0xff] }],
+    ['image/gif', { extension: '.gif', prefix: [0x47, 0x49, 0x46, 0x38] }],
   ])
   const contentType = typeof body.contentType === 'string' ? body.contentType.toLowerCase() : ''
   const type = permitted.get(contentType)
   const filename = body.filename.replace(/[\u0000-\u001f\u007f]/g, '_').slice(0, 255)
-  if (!type || !filename.toLowerCase().endsWith(type.extension)) {
-    return errorResponse('Only PDF, PNG, and JPEG attachments are accepted.', 415, origin)
+  if (!type || (kind === 'template_image' && type.extension === '.pdf') || !filename.toLowerCase().endsWith(type.extension)) {
+    return errorResponse(kind === 'template_image' ? 'Only PNG, JPEG, and GIF template images are accepted.' : 'Only PDF, PNG, JPEG, and GIF attachments are accepted.', 415, origin)
   }
   return createUploadIntent(env, {
     workspaceId: body.workspaceId,
-    kind: 'attachment',
+    kind,
     filename,
     sizeBytes: body.sizeBytes,
     contentType,
@@ -2062,7 +2197,7 @@ async function testCampaign(request, env, session, origin) {
   ).bind(body.campaignId, session.userId).first()
   if (!campaign) return errorResponse('Campaign not found or cannot be tested.', 404, origin)
   const step = await env.DB.prepare(
-    'SELECT subject, body_template FROM sequences WHERE campaign_id = ? AND step_no = 1',
+    'SELECT subject, body_template, body_html FROM sequences WHERE campaign_id = ? AND step_no = 1',
   ).bind(campaign.id).first()
   if (!step) return errorResponse('Add a first sequence step before testing.', 409, origin)
   if (!env.BREVO_API_KEY) return errorResponse('Test sending is not configured yet.', 503, origin)
@@ -2074,6 +2209,7 @@ async function testCampaign(request, env, session, origin) {
     email: session.email,
     subject: step.subject,
     text: renderTemplate(step.body_template, { first_name: '', company: '' }),
+    html: step.body_html ? renderTemplate(step.body_html, { first_name: '', company: '' }) : null,
     unsubscribeToken: token,
     messageId: null,
     tag: 'kluzar-outreach-test',
@@ -2328,9 +2464,30 @@ function encodeMimeBody(value) {
   return base64Url(bytes)
 }
 
+function withUnsubscribeFooter(html, token) {
+  if (!html || !token) return html ?? null
+  const unsubscribeUrl = `https://outreach-api.kluzar.com/v1/unsubscribe/${token}`
+  if (html.includes(unsubscribeUrl) || html.includes('/v1/unsubscribe/')) return html
+  return `${html}<p style="font-size:12px;line-height:1.5;color:#71717a;margin:16px 0 0;">If you no longer want to receive these emails, <a href="${unsubscribeUrl}" style="color:#71717a;">unsubscribe here</a>.</p>`
+}
+
 async function sendBrevo(env, message) {
   if (!env.BREVO_API_KEY) return null
-  const unsubscribeUrl = `https://outreach-api.kluzar.com/v1/unsubscribe/${message.unsubscribeToken}`
+  const payload = {
+    sender: { name: 'Kluzar', email: 'hello@kluzar.com' },
+    to: [{ email: message.email }],
+    subject: message.subject,
+    textContent: message.text,
+    tags: [message.tag ?? 'kluzar-outreach'],
+  }
+  if (message.html) payload.htmlContent = withUnsubscribeFooter(message.html, message.unsubscribeToken)
+  if (message.unsubscribeToken) {
+    const unsubscribeUrl = `https://outreach-api.kluzar.com/v1/unsubscribe/${message.unsubscribeToken}`
+    payload.headers = {
+      'List-Unsubscribe': `<${unsubscribeUrl}>`,
+      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    }
+  }
   let result
   try {
     const response = await fetch(`${BREVO_API_URL}/smtp/email`, {
@@ -2340,17 +2497,7 @@ async function sendBrevo(env, message) {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      body: JSON.stringify({
-        sender: { name: 'Kluzar', email: 'hello@kluzar.com' },
-        to: [{ email: message.email }],
-        subject: message.subject,
-        textContent: message.text,
-        headers: {
-          'List-Unsubscribe': `<${unsubscribeUrl}>`,
-          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
-        },
-        tags: [message.tag ?? 'kluzar-outreach'],
-      }),
+      body: JSON.stringify(payload),
       redirect: 'error',
       signal: AbortSignal.timeout(10000),
     })
@@ -2369,18 +2516,42 @@ async function sendGmail(env, sender, credentials, message) {
     `To: ${message.email}`,
     `Subject: ${encodeMimeSubject(message.subject)}`,
     'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset=UTF-8',
   ]
   if (message.unsubscribeToken) {
     const unsubscribeUrl = `https://outreach-api.kluzar.com/v1/unsubscribe/${message.unsubscribeToken}`
     headers.push(`List-Unsubscribe: <${unsubscribeUrl}>`)
     headers.push('List-Unsubscribe-Post: List-Unsubscribe=One-Click')
   }
-  const raw = [
-    ...headers,
-    '',
-    message.text.replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
-  ].join('\r\n')
+  const plainText = message.text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  let raw
+  if (message.html) {
+    const boundary = `kluzar-${randomToken(16)}`
+    const html = withUnsubscribeFooter(message.html, message.unsubscribeToken)
+    headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`)
+    raw = [
+      ...headers,
+      '',
+      `--${boundary}`,
+      'Content-Type: text/plain; charset=UTF-8',
+      'Content-Transfer-Encoding: 8bit',
+      '',
+      plainText,
+      `--${boundary}`,
+      'Content-Type: text/html; charset=UTF-8',
+      'Content-Transfer-Encoding: 8bit',
+      '',
+      html,
+      `--${boundary}--`,
+      '',
+    ].join('\r\n')
+  } else {
+    headers.push('Content-Type: text/plain; charset=UTF-8')
+    raw = [
+      ...headers,
+      '',
+      plainText,
+    ].join('\r\n')
+  }
   try {
     const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
@@ -2416,7 +2587,9 @@ async function sendMicrosoft(sender, credentials, message) {
       },
       body: JSON.stringify({
         subject: message.subject,
-        body: { contentType: 'Text', content: message.text },
+        body: message.html
+          ? { contentType: 'Html', content: withUnsubscribeFooter(message.html, message.unsubscribeToken) }
+          : { contentType: 'Text', content: message.text },
         toRecipients: [{ emailAddress: { address: message.email } }],
         internetMessageHeaders: headers,
       }),
@@ -2662,6 +2835,7 @@ async function runScheduler(env) {
     `UPDATE sends SET status = 'failed'
      WHERE status = 'sending' AND sending_at < ?`,
   ).bind(now - 1800000).run()
+  await rampWarmup(env, now)
   await pollReplies(env, now)
   await processNoReplyBranches(env, now)
   await launchScheduledCampaigns(env, now)
@@ -2800,6 +2974,7 @@ async function recordReply(env, send, reply) {
     ).bind(send.lead_id, send.campaign_id),
   ])
   await executeBranches(env, send, 'replied', reply.receivedAt)
+  await evaluateWorkflowRules(env, send, 'reply', reply.receivedAt, reply.bodyText)
   const workspace = await env.DB.prepare(
     'SELECT w.id, w.owner_email, w.notify_reply_email, c.name FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id WHERE c.id = ?',
   ).bind(send.campaign_id).first()
@@ -2823,7 +2998,10 @@ async function processNoReplyBranches(env, now) {
        AND c.status = 'active' AND l.status NOT IN ('replied', 'bounced', 'unsubscribed')
      ORDER BY s.sent_at DESC LIMIT 200`,
   ).all()
-  for (const send of rows.results ?? []) await executeBranches(env, send, 'no_reply_after_days', now)
+  for (const send of rows.results ?? []) {
+    await executeBranches(env, send, 'no_reply_after_days', now)
+    await evaluateWorkflowRules(env, send, 'no_reply', now, null)
+  }
 }
 
 async function executeBranches(env, send, condition, at) {
@@ -2912,13 +3090,15 @@ async function notifyWorkspace(env, workspace, message, emailAllowed = true) {
 
 async function sendDueMessages(env, now) {
   const rows = await env.DB.prepare(
-    `SELECT s.id, s.campaign_id, s.lead_id, s.sequence_step, s.is_reply_followup,
+    `SELECT s.id, s.campaign_id, s.lead_id, s.sequence_step, s.is_reply_followup, s.ab_variant_id,
             l.workspace_id, l.email AS lead_email, l.first_name, l.company, l.status AS lead_status,
-            c.sender_id, c.status AS campaign_status, q.subject, q.body_template,
+            c.sender_id, c.status AS campaign_status, q.subject, q.body_template, q.body_html,
+            v.subject AS variant_subject, v.body_template AS variant_body, v.body_html AS variant_html,
             d.type AS sender_type, d.address AS sender_address, d.display_name AS sender_name,
             d.credentials_ref, d.credentials_expires_at, w.owner_email
      FROM sends s JOIN campaigns c ON c.id = s.campaign_id
      JOIN leads l ON l.id = s.lead_id JOIN sequences q ON q.campaign_id = s.campaign_id AND q.step_no = s.sequence_step
+     LEFT JOIN ab_variants v ON v.id = s.ab_variant_id
      JOIN senders d ON d.id = c.sender_id JOIN workspaces w ON w.id = c.workspace_id
      WHERE s.status = 'queued' AND s.scheduled_at <= ? AND c.status = 'active'
      ORDER BY s.scheduled_at LIMIT 100`,
@@ -2938,6 +3118,7 @@ async function sendDueMessages(env, now) {
       await env.DB.prepare("UPDATE sends SET status = 'stopped' WHERE id = ? AND status = 'queued'").bind(send.id).run()
       continue
     }
+    if (await warmupCapReached(env, send.sender_id, now)) continue
     const sentToday = await dailySendCount(env, send.workspace_id, now)
     const lastAt = await lastSendAt(env, send.workspace_id)
     if (sentToday >= DAILY_SEND_LIMIT || (lastAt && now - lastAt < SEND_INTERVAL_SECONDS * 1000)) continue
@@ -2954,10 +3135,14 @@ async function sendDueMessages(env, now) {
       await env.DB.prepare("UPDATE sends SET status = 'failed' WHERE id = ?").bind(send.id).run()
       continue
     }
+    const leadVars = { first_name: send.first_name ?? '', company: send.company ?? '' }
+    const bodyTemplate = send.variant_body ?? send.body_template
+    const bodyHtml = send.variant_html ?? send.body_html
     const message = {
       email: send.lead_email,
-      subject: send.subject,
-      text: renderTemplate(send.body_template, { first_name: send.first_name ?? '', company: send.company ?? '' }),
+      subject: send.variant_subject ?? send.subject,
+      text: renderTemplate(bodyTemplate, leadVars),
+      html: bodyHtml ? renderTemplate(bodyHtml, leadVars) : null,
       unsubscribeToken,
     }
     const sender = {
@@ -2999,6 +3184,1189 @@ async function sendDueMessages(env, now) {
   }
 }
 
+function escapeHtml(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+}
+
+function sanitizeHexColor(value, fallback) {
+  return typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback
+}
+
+function sanitizeAlign(value) {
+  return ['left', 'center', 'right'].includes(value) ? value : 'left'
+}
+
+function isHttpsUrl(value) {
+  try {
+    return new URL(value).protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function headingSize(size) {
+  return size === 'small' ? 20 : size === 'large' ? 36 : 28
+}
+
+function blockHtml(block) {
+  if (block.type === 'heading') {
+    return `<h2 style="margin:0 0 12px;font-size:${headingSize(block.size)}px;line-height:1.25;font-weight:700;color:${block.color};text-align:${block.align};font-family:Inter,Arial,Helvetica,sans-serif;">${escapeHtml(block.text)}</h2>`
+  }
+  if (block.type === 'text') {
+    const lines = escapeHtml(block.text).split('\n').map((line) => (line === '' ? '&nbsp;' : line)).join('<br>')
+    return `<p style="margin:0 0 12px;font-size:${block.size}px;line-height:1.65;color:${block.color};text-align:${block.align};font-family:Inter,Arial,Helvetica,sans-serif;">${lines}</p>`
+  }
+  if (block.type === 'image') {
+    const src = block.fileId
+      ? `https://outreach-api.kluzar.com/v1/images/${block.fileId}`
+      : block.src
+    if (!src) return ''
+    return `<div style="text-align:${block.align};margin:0 0 12px;"><img src="${escapeHtml(src)}" alt="${escapeHtml(block.alt)}" style="width:${block.width}%;max-width:100%;height:auto;border:0;display:inline-block;"></div>`
+  }
+  if (block.type === 'button') {
+    const href = isHttpsUrl(block.url) ? escapeHtml(block.url) : '#'
+    return `<div style="text-align:${block.align};margin:0 0 12px;"><a href="${href}" style="display:inline-block;background:${block.background};color:${block.color};font-family:Inter,Arial,Helvetica,sans-serif;font-size:14px;font-weight:600;line-height:1;text-decoration:none;padding:12px 24px;border-radius:8px;">${escapeHtml(block.label)}</a></div>`
+  }
+  if (block.type === 'divider') {
+    return `<hr style="border:0;border-top:1px solid ${block.color};margin:16px 0;">`
+  }
+  return `<div style="height:${block.height}px;line-height:${block.height}px;font-size:1px;">&nbsp;</div>`
+}
+
+export function compileTemplateHtml(blocks) {
+  const inner = blocks.map(blockHtml).filter(Boolean).join('\n')
+  return `<div style="max-width:600px;margin:0 auto;padding:24px 16px;background:#ffffff;font-family:Inter,Arial,Helvetica,sans-serif;">\n${inner}\n</div>`
+}
+
+export function compileTemplateText(blocks) {
+  const lines = []
+  for (const block of blocks) {
+    if (block.type === 'heading' || block.type === 'text') lines.push(block.text)
+    if (block.type === 'image' && block.alt) lines.push(`[Image: ${block.alt}]`)
+    if (block.type === 'button') lines.push(`${block.label}: ${block.url}`)
+  }
+  return lines.filter((line) => line.trim() !== '').join('\n\n')
+}
+
+async function validateTemplateBlocks(env, workspaceId, blocks) {
+  if (!Array.isArray(blocks) || blocks.length < 1 || blocks.length > 50) return { error: 'Add between 1 and 50 template blocks.' }
+  const normalized = []
+  for (let index = 0; index < blocks.length; index += 1) {
+    const block = blocks[index]
+    if (!isObject(block) || !['heading', 'text', 'image', 'button', 'divider', 'spacer'].includes(block.type)) {
+      return { error: 'Each template block must have a valid type.' }
+    }
+    const id = typeof block.id === 'string' && block.id.trim().length > 0 ? block.id.trim().slice(0, 100) : `block-${index}`
+    if (block.type === 'heading') {
+      if (typeof block.text !== 'string' || block.text.length > 200) return { error: 'Heading text must be 200 characters or fewer.' }
+      normalized.push({ id, type: 'heading', text: block.text, size: ['small', 'medium', 'large'].includes(block.size) ? block.size : 'medium', color: sanitizeHexColor(block.color, '#18181b'), align: sanitizeAlign(block.align) })
+    } else if (block.type === 'text') {
+      if (typeof block.text !== 'string' || block.text.length > 5000) return { error: 'Text blocks must be 5000 characters or fewer.' }
+      const size = Number.isInteger(block.size) ? Math.min(20, Math.max(12, block.size)) : 15
+      normalized.push({ id, type: 'text', text: block.text, size, color: sanitizeHexColor(block.color, '#3f3f46'), align: sanitizeAlign(block.align) })
+    } else if (block.type === 'image') {
+      const alt = typeof block.alt === 'string' ? block.alt.slice(0, 200) : ''
+      const width = [25, 50, 75, 100].includes(block.width) ? block.width : 100
+      const fileId = block.fileId === undefined || block.fileId === null ? null : block.fileId
+      if (fileId !== null) {
+        if (typeof fileId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(fileId)) return { error: 'Choose a valid template image.' }
+        const file = await env.DB.prepare("SELECT id FROM files WHERE id = ? AND workspace_id = ? AND kind = 'template_image'").bind(fileId, workspaceId).first()
+        if (!file) return { error: 'Template image not found.' }
+      }
+      const src = typeof block.src === 'string' ? block.src.slice(0, 500) : ''
+      if (!fileId && src && !isHttpsUrl(src)) return { error: 'Image URLs must start with https://' }
+      normalized.push({ id, type: 'image', src: fileId ? '' : src, fileId, alt, width, align: sanitizeAlign(block.align) })
+    } else if (block.type === 'button') {
+      if (typeof block.label !== 'string' || block.label.length > 100) return { error: 'Button labels must be 100 characters or fewer.' }
+      const url = typeof block.url === 'string' ? block.url.slice(0, 500) : ''
+      if (url && !isHttpsUrl(url)) return { error: 'Button links must start with https://' }
+      normalized.push({ id, type: 'button', label: block.label, url, background: sanitizeHexColor(block.background, '#18181b'), color: sanitizeHexColor(block.color, '#ffffff'), align: sanitizeAlign(block.align) })
+    } else if (block.type === 'divider') {
+      normalized.push({ id, type: 'divider', color: sanitizeHexColor(block.color, '#e4e4e7') })
+    } else {
+      const height = Number.isInteger(block.height) ? Math.min(80, Math.max(8, block.height)) : 24
+      normalized.push({ id, type: 'spacer', height })
+    }
+  }
+  return { blocks: normalized }
+}
+
+const SANITIZE_ALLOWED_TAGS = new Set(['a', 'p', 'h1', 'h2', 'h3', 'strong', 'em', 'ul', 'ol', 'li', 'br', 'img', 'div', 'hr'])
+const SANITIZE_STYLE_PROPS = new Set(['color', 'background', 'font-size', 'font-weight', 'text-align', 'line-height', 'margin', 'padding', 'border-radius', 'display'])
+const SANITIZE_VOID_TAGS = new Set(['br', 'img', 'hr'])
+
+function sanitizeStyle(value) {
+  const kept = []
+  for (const declaration of String(value).split(';')) {
+    const colon = declaration.indexOf(':')
+    if (colon < 1) continue
+    const property = declaration.slice(0, colon).trim().toLowerCase()
+    const styleValue = declaration.slice(colon + 1).trim()
+    if (!SANITIZE_STYLE_PROPS.has(property) || !styleValue) continue
+    if (/url\s*\(|expression|javascript:|</i.test(styleValue)) continue
+    if (!/^[a-zA-Z0-9#%.,() \-]+$/.test(styleValue)) continue
+    kept.push(`${property}:${styleValue}`)
+  }
+  return kept.join(';')
+}
+
+function sanitizeAttributes(tag, raw) {
+  const attributes = []
+  const pattern = /([A-Za-z][A-Za-z0-9-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g
+  let match
+  while ((match = pattern.exec(raw)) !== null) {
+    const name = match[1].toLowerCase()
+    const value = match[2] ?? match[3] ?? match[4] ?? ''
+    if (name.startsWith('on')) continue
+    if (name === 'href' && tag === 'a') {
+      if (!isHttpsUrl(value)) continue
+      attributes.push(`href="${escapeHtml(value)}"`)
+    } else if (name === 'src' && tag === 'img') {
+      if (!value.startsWith('https://outreach-api.kluzar.com/v1/images/')) continue
+      attributes.push(`src="${escapeHtml(value)}"`)
+    } else if (name === 'alt' && tag === 'img') {
+      attributes.push(`alt="${escapeHtml(value.slice(0, 200))}"`)
+    } else if (name === 'style') {
+      const cleaned = sanitizeStyle(value)
+      if (cleaned) attributes.push(`style="${escapeHtml(cleaned)}"`)
+    }
+  }
+  return attributes.length ? ` ${attributes.join(' ')}` : ''
+}
+
+export function sanitizeHtml(input) {
+  if (typeof input !== 'string') return ''
+  let output = ''
+  let index = 0
+  let skipTag = null
+  const tagPattern = /<!--[\s\S]*?-->|<\/?([A-Za-z][A-Za-z0-9]*)\b([^>]*)>/g
+  let match
+  while ((match = tagPattern.exec(input)) !== null) {
+    const text = input.slice(index, match.index)
+    if (!skipTag) output += escapeHtml(text)
+    index = tagPattern.lastIndex
+    if (match[0].startsWith('<!--')) continue
+    const tag = match[1].toLowerCase()
+    const closing = match[0].startsWith('</')
+    if (skipTag) {
+      if (closing && tag === skipTag) skipTag = null
+      continue
+    }
+    if (tag === 'script' || tag === 'style') {
+      if (!closing && !match[0].endsWith('/>')) skipTag = tag
+      continue
+    }
+    if (!SANITIZE_ALLOWED_TAGS.has(tag)) continue
+    if (closing) {
+      if (!SANITIZE_VOID_TAGS.has(tag)) output += `</${tag}>`
+      continue
+    }
+    output += `<${tag}${sanitizeAttributes(tag, match[2] ?? '')}${SANITIZE_VOID_TAGS.has(tag) ? ' /' : ''}>`
+  }
+  if (!skipTag) output += escapeHtml(input.slice(index))
+  return output
+}
+
+async function resolveSequenceHtml(env, workspaceId, body) {
+  if (body.templateId !== undefined && body.templateId !== null) {
+    if (typeof body.templateId !== 'string' || !body.templateId || body.templateId.length > 100) return { error: 'Choose a valid template.' }
+    const template = await env.DB.prepare(
+      'SELECT blocks_json FROM templates WHERE id = ? AND workspace_id = ?',
+    ).bind(body.templateId, workspaceId).first()
+    if (!template) return { error: 'Template not found.' }
+    let blocks
+    try {
+      blocks = JSON.parse(template.blocks_json)
+    } catch {
+      return { error: 'Template could not be read.' }
+    }
+    const validated = await validateTemplateBlocks(env, workspaceId, blocks)
+    if (validated.error) return { error: validated.error }
+    return { html: compileTemplateHtml(validated.blocks), templateId: body.templateId }
+  }
+  if (body.bodyHtml !== undefined && body.bodyHtml !== null) {
+    if (typeof body.bodyHtml !== 'string' || !body.bodyHtml || body.bodyHtml.length > 100000) return { error: 'Enter valid HTML content.' }
+    return { html: sanitizeHtml(body.bodyHtml), templateId: null }
+  }
+  return { html: null, templateId: null }
+}
+
+function analyticsBuckets(rows) {
+  const counts = { sent: 0, delivered: 0, opened: 0, clicked: 0, replied: 0, bounced: 0 }
+  for (const row of rows) {
+    const n = Number(row.n ?? 0)
+    if (['sent', 'delivered', 'opened', 'clicked', 'replied', 'bounced'].includes(row.status)) counts.sent += n
+    if (['delivered', 'opened', 'clicked', 'replied'].includes(row.status)) counts.delivered += n
+    if (['opened', 'clicked', 'replied'].includes(row.status)) counts.opened += n
+    if (['clicked', 'replied'].includes(row.status)) counts.clicked += n
+    if (row.status === 'replied') counts.replied += n
+    if (row.status === 'bounced') counts.bounced += n
+  }
+  return counts
+}
+
+function analyticsRates(counts) {
+  const deliveredBase = counts.delivered > 0 ? counts.delivered : counts.sent
+  const openRate = deliveredBase > 0 ? Math.round((counts.opened / deliveredBase) * 1000) / 10 : null
+  const replyRate = deliveredBase > 0 ? Math.round((counts.replied / deliveredBase) * 1000) / 10 : null
+  const bounceRate = counts.sent > 0 ? Math.round((counts.bounced / counts.sent) * 1000) / 10 : null
+  return { openRate, replyRate, bounceRate }
+}
+
+function analyticsTrend(current, previous) {
+  if (previous === null || previous === 0) return null
+  return Math.round(((current - previous) / previous) * 1000) / 10
+}
+
+async function getAnalytics(env, url, session, origin) {
+  const workspaceId = url.searchParams.get('workspaceId')
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  let days = Number.parseInt(url.searchParams.get('days') ?? '30', 10)
+  if (!Number.isInteger(days) || days < 1) days = 30
+  if (days > 90) days = 90
+  const now = Date.now()
+  const dayMs = 86400000
+  const windowStart = now - days * dayMs
+  const prevStart = now - 2 * days * dayMs
+  const currentRows = await env.DB.prepare(
+    `SELECT status, COUNT(*) AS n FROM sends
+     WHERE campaign_id IN (SELECT id FROM campaigns WHERE workspace_id = ?)
+       AND created_at >= ? AND created_at < ?
+     GROUP BY status`,
+  ).bind(workspaceId, windowStart, now).all()
+  const previousRows = await env.DB.prepare(
+    `SELECT status, COUNT(*) AS n FROM sends
+     WHERE campaign_id IN (SELECT id FROM campaigns WHERE workspace_id = ?)
+       AND created_at >= ? AND created_at < ?
+     GROUP BY status`,
+  ).bind(workspaceId, prevStart, windowStart).all()
+  const current = analyticsBuckets(currentRows.results ?? [])
+  const previous = analyticsBuckets(previousRows.results ?? [])
+  const currentRates = analyticsRates(current)
+  const previousRates = analyticsRates(previous)
+  const seriesRows = await env.DB.prepare(
+    `SELECT CAST(created_at / 86400000 AS INTEGER) AS day, status, COUNT(*) AS n FROM sends
+     WHERE campaign_id IN (SELECT id FROM campaigns WHERE workspace_id = ?)
+       AND created_at >= ? AND created_at < ?
+     GROUP BY day, status`,
+  ).bind(workspaceId, windowStart, now).all()
+  const byDay = new Map()
+  for (const row of seriesRows.results ?? []) {
+    const day = Number(row.day)
+    const bucket = byDay.get(day) ?? { sent: 0, opened: 0, replied: 0, bounced: 0 }
+    const n = Number(row.n ?? 0)
+    if (['sent', 'delivered', 'opened', 'clicked', 'replied', 'bounced'].includes(row.status)) bucket.sent += n
+    if (['opened', 'clicked', 'replied'].includes(row.status)) bucket.opened += n
+    if (row.status === 'replied') bucket.replied += n
+    if (row.status === 'bounced') bucket.bounced += n
+    byDay.set(day, bucket)
+  }
+  const todayDay = Math.floor(now / dayMs)
+  const series = []
+  for (let index = days - 1; index >= 0; index -= 1) {
+    const day = todayDay - index
+    const bucket = byDay.get(day) ?? { sent: 0, opened: 0, replied: 0, bounced: 0 }
+    series.push({ date: day * 86400, sent: bucket.sent, opened: bucket.opened, replied: bucket.replied, bounced: bucket.bounced })
+  }
+  return jsonResponse({
+    windowDays: days,
+    windowLabel: `Last ${days} days`,
+    sent: current.sent,
+    delivered: current.delivered,
+    opened: current.opened,
+    clicked: current.clicked,
+    replied: current.replied,
+    bounced: current.bounced,
+    openRate: currentRates.openRate,
+    replyRate: currentRates.replyRate,
+    bounceRate: currentRates.bounceRate,
+    trends: {
+      sent: analyticsTrend(current.sent, previous.sent),
+      openRate: analyticsTrend(currentRates.openRate, previousRates.openRate),
+      replyRate: analyticsTrend(currentRates.replyRate, previousRates.replyRate),
+      bounceRate: analyticsTrend(currentRates.bounceRate, previousRates.bounceRate),
+    },
+    series,
+  }, origin)
+}
+
+function templateRow(row) {
+  let blocks = []
+  try {
+    blocks = JSON.parse(row.blocks_json)
+  } catch {
+    blocks = []
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    subject: row.subject,
+    blocks,
+    html: row.html,
+    text: row.text,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  }
+}
+
+async function listTemplates(env, url, session, origin) {
+  const workspaceId = url.searchParams.get('workspaceId')
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  const rows = await env.DB.prepare(
+    'SELECT id, name, subject, blocks_json, html, text, created_at, updated_at FROM templates WHERE workspace_id = ? ORDER BY created_at DESC',
+  ).bind(workspaceId).all()
+  return jsonResponse((rows.results ?? []).map(templateRow), origin)
+}
+
+async function createTemplate(request, env, session, origin) {
+  const body = await readJson(request)
+  if (!isObject(body) || !await ownsWorkspace(env, body.workspaceId, session.userId)) return errorResponse('Enter valid template details.', 400, origin)
+  if (!safeText(body.name, 100)) return errorResponse('Enter a template name of 100 characters or fewer.', 400, origin)
+  if (typeof body.subject !== 'string' || body.subject.length > 200) return errorResponse('Subject must be 200 characters or fewer.', 400, origin)
+  const validated = await validateTemplateBlocks(env, body.workspaceId, body.blocks)
+  if (validated.error) return errorResponse(validated.error, 400, origin)
+  const id = crypto.randomUUID()
+  const now = Date.now()
+  const html = compileTemplateHtml(validated.blocks)
+  const text = compileTemplateText(validated.blocks)
+  try {
+    await env.DB.prepare(
+      'INSERT INTO templates (id, workspace_id, name, subject, blocks_json, html, text, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).bind(id, body.workspaceId, body.name.trim(), body.subject, JSON.stringify(validated.blocks), html, text, now, now).run()
+  } catch {
+    return errorResponse('A template with this name already exists.', 409, origin)
+  }
+  return jsonResponse({ id, name: body.name.trim(), subject: body.subject, blocks: validated.blocks, html, text, created_at: now, updated_at: now }, origin, 201)
+}
+
+async function getTemplate(env, templateId, url, session, origin) {
+  const workspaceId = url.searchParams.get('workspaceId')
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  const row = await env.DB.prepare(
+    'SELECT id, name, subject, blocks_json, html, text, created_at, updated_at FROM templates WHERE id = ? AND workspace_id = ?',
+  ).bind(templateId, workspaceId).first()
+  if (!row) return errorResponse('Template not found.', 404, origin)
+  return jsonResponse(templateRow(row), origin)
+}
+
+async function updateTemplate(request, env, templateId, url, session, origin) {
+  const body = await readJson(request)
+  const workspaceId = url.searchParams.get('workspaceId') ?? (isObject(body) ? body.workspaceId : null)
+  if (!isObject(body) || !await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Enter valid template details.', 400, origin)
+  const existing = await env.DB.prepare(
+    'SELECT id, name, subject, blocks_json, html, text, created_at, updated_at FROM templates WHERE id = ? AND workspace_id = ?',
+  ).bind(templateId, workspaceId).first()
+  if (!existing) return errorResponse('Template not found.', 404, origin)
+  const name = body.name === undefined ? existing.name : body.name
+  const subject = body.subject === undefined ? existing.subject : body.subject
+  if (!safeText(name, 100)) return errorResponse('Enter a template name of 100 characters or fewer.', 400, origin)
+  if (typeof subject !== 'string' || subject.length > 200) return errorResponse('Subject must be 200 characters or fewer.', 400, origin)
+  let blocks = []
+  try {
+    blocks = JSON.parse(existing.blocks_json)
+  } catch {
+    blocks = []
+  }
+  let html = existing.html
+  let text = existing.text
+  if (body.blocks !== undefined) {
+    const validated = await validateTemplateBlocks(env, workspaceId, body.blocks)
+    if (validated.error) return errorResponse(validated.error, 400, origin)
+    blocks = validated.blocks
+    html = compileTemplateHtml(blocks)
+    text = compileTemplateText(blocks)
+  }
+  const now = Date.now()
+  try {
+    await env.DB.prepare(
+      'UPDATE templates SET name = ?, subject = ?, blocks_json = ?, html = ?, text = ?, updated_at = ? WHERE id = ? AND workspace_id = ?',
+    ).bind(name.trim(), subject, JSON.stringify(blocks), html, text, now, templateId, workspaceId).run()
+  } catch {
+    return errorResponse('A template with this name already exists.', 409, origin)
+  }
+  return jsonResponse({ id: templateId, name: name.trim(), subject, blocks, html, text, created_at: existing.created_at, updated_at: now }, origin)
+}
+
+async function deleteTemplate(env, templateId, url, session, origin) {
+  const workspaceId = url.searchParams.get('workspaceId')
+  if (!workspaceId || !await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  const row = await env.DB.prepare(
+    'DELETE FROM templates WHERE id = ? AND workspace_id = ? RETURNING id',
+  ).bind(templateId, workspaceId).first()
+  if (!row) return errorResponse('Template not found.', 404, origin)
+  return noContentResponse(origin)
+}
+
+function warmupRow(row) {
+  return {
+    senderId: row.sender_id,
+    senderEmail: row.address,
+    status: row.status ?? 'not_started',
+    startedAt: row.started_at ?? null,
+    currentDailyCap: Number(row.current_daily_cap ?? 0),
+    targetDailyCap: Number(row.target_daily_cap ?? 50),
+    rampStep: Number(row.ramp_step ?? 5),
+  }
+}
+
+async function getWarmup(env, url, session, origin) {
+  const workspaceId = url.searchParams.get('workspaceId')
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  const rows = await env.DB.prepare(
+    `SELECT s.id AS sender_id, s.address, w.status, w.started_at, w.current_daily_cap, w.target_daily_cap, w.ramp_step
+     FROM senders s LEFT JOIN warmup_state w ON w.sender_id = s.id AND w.workspace_id = s.workspace_id
+     WHERE s.workspace_id = ? ORDER BY s.created_at`,
+  ).bind(workspaceId).all()
+  return jsonResponse((rows.results ?? []).map(warmupRow), origin)
+}
+
+async function warmupCapReached(env, senderId, now) {
+  const state = await env.DB.prepare(
+    "SELECT status, current_daily_cap FROM warmup_state WHERE sender_id = ?",
+  ).bind(senderId).first()
+  if (!state || state.status !== 'ramping') return false
+  const dayStart = Date.parse(`${new Date(now).toISOString().slice(0, 10)}T00:00:00.000Z`)
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS count FROM sends s JOIN campaigns c ON c.id = s.campaign_id
+     WHERE c.sender_id = ? AND s.sent_at >= ? AND s.status IN ('sent', 'delivered', 'opened', 'clicked', 'replied', 'bounced')`,
+  ).bind(senderId, dayStart).first()
+  return Number(row?.count ?? 0) >= Math.min(Number(state.current_daily_cap), 50)
+}
+
+async function rampWarmup(env, now) {
+  const dayNumber = Math.floor(now / 86400000)
+  const rows = await env.DB.prepare(
+    "SELECT workspace_id, sender_id, current_daily_cap, target_daily_cap, ramp_step, ramped_on FROM warmup_state WHERE status = 'ramping'",
+  ).all()
+  for (const row of rows.results ?? []) {
+    if (Number(row.ramped_on) === dayNumber) continue
+    const nextCap = Math.min(Number(row.target_daily_cap), Number(row.current_daily_cap) + Number(row.ramp_step))
+    const status = nextCap >= Number(row.target_daily_cap) ? 'complete' : 'ramping'
+    await env.DB.prepare(
+      "UPDATE warmup_state SET current_daily_cap = ?, status = ?, ramped_on = ? WHERE workspace_id = ? AND sender_id = ? AND status = 'ramping' AND (ramped_on IS NULL OR ramped_on <> ?)",
+    ).bind(nextCap, status, dayNumber, row.workspace_id, row.sender_id, dayNumber).run()
+  }
+}
+
+async function warmupActionResponse(request, env, action, session, origin) {
+  const body = await readJson(request)
+  if (!isObject(body) || !await ownsWorkspace(env, body.workspaceId, session.userId) || !safeText(body.senderId, 100)) {
+    return errorResponse('Choose a valid workspace and sender.', 400, origin)
+  }
+  const sender = await env.DB.prepare(
+    'SELECT id, address FROM senders WHERE id = ? AND workspace_id = ?',
+  ).bind(body.senderId, body.workspaceId).first()
+  if (!sender) return errorResponse('Sender not found.', 404, origin)
+  const now = Date.now()
+  const dayNumber = Math.floor(now / 86400000)
+  if (action === 'start') {
+    await env.DB.prepare(
+      `INSERT INTO warmup_state (workspace_id, sender_id, status, started_at, current_daily_cap, target_daily_cap, ramp_step, ramped_on)
+       VALUES (?, ?, 'ramping', ?, 5, 50, 5, ?)
+       ON CONFLICT(workspace_id, sender_id) DO UPDATE SET
+         status = 'ramping', started_at = excluded.started_at, current_daily_cap = warmup_state.ramp_step, ramped_on = excluded.ramped_on`,
+    ).bind(body.workspaceId, body.senderId, now, dayNumber).run()
+  } else {
+    const state = await env.DB.prepare(
+      'SELECT status FROM warmup_state WHERE workspace_id = ? AND sender_id = ?',
+    ).bind(body.workspaceId, body.senderId).first()
+    if (!state) return errorResponse('Warm-up has not started for this sender.', 404, origin)
+    if (action === 'pause') {
+      if (state.status !== 'ramping') return errorResponse('Only a ramping warm-up can be paused.', 409, origin)
+      await env.DB.prepare(
+        "UPDATE warmup_state SET status = 'paused' WHERE workspace_id = ? AND sender_id = ?",
+      ).bind(body.workspaceId, body.senderId).run()
+    } else {
+      if (state.status !== 'paused') return errorResponse('Only a paused warm-up can be resumed.', 409, origin)
+      await env.DB.prepare(
+        "UPDATE warmup_state SET status = 'ramping' WHERE workspace_id = ? AND sender_id = ?",
+      ).bind(body.workspaceId, body.senderId).run()
+    }
+  }
+  const row = await env.DB.prepare(
+    `SELECT s.id AS sender_id, s.address, w.status, w.started_at, w.current_daily_cap, w.target_daily_cap, w.ramp_step
+     FROM senders s JOIN warmup_state w ON w.sender_id = s.id AND w.workspace_id = s.workspace_id
+     WHERE s.id = ? AND s.workspace_id = ?`,
+  ).bind(body.senderId, body.workspaceId).first()
+  return jsonResponse(warmupRow(row), origin)
+}
+
+async function listMembers(env, workspaceId, session, origin) {
+  const role = await workspaceRole(env, workspaceId, session.userId)
+  if (role !== 'owner' && role !== 'admin') return errorResponse('Workspace not found.', 404, origin)
+  const workspace = await env.DB.prepare(
+    'SELECT id, owner_user_id, owner_email, created_at FROM workspaces WHERE id = ?',
+  ).bind(workspaceId).first()
+  const members = await env.DB.prepare(
+    'SELECT user_id, role, created_at FROM workspace_members WHERE workspace_id = ? ORDER BY created_at',
+  ).bind(workspaceId).all()
+  const rows = members.results ?? []
+  const emails = new Map()
+  const ids = rows.map((row) => row.user_id)
+  if (ids.length) {
+    try {
+      const placeholders = ids.map(() => '?').join(',')
+      const users = await env.ACCOUNTS_DB.prepare(
+        `SELECT id, email FROM users WHERE id IN (${placeholders})`,
+      ).bind(...ids).all()
+      for (const user of users.results ?? []) emails.set(user.id, user.email)
+    } catch {
+    }
+  }
+  const result = [{
+    userId: workspace.owner_user_id,
+    email: workspace.owner_email,
+    role: 'owner',
+    created_at: workspace.created_at,
+  }]
+  for (const row of rows) {
+    result.push({ userId: row.user_id, email: emails.get(row.user_id) ?? null, role: row.role, created_at: row.created_at })
+  }
+  return jsonResponse(result, origin)
+}
+
+async function createInvite(request, env, workspaceId, session, origin) {
+  const body = await readJson(request)
+  const role = await workspaceRole(env, workspaceId, session.userId)
+  if (role !== 'owner' && role !== 'admin') return errorResponse('Workspace not found.', 404, origin)
+  if (!isObject(body) || !isValidEmail(body.email)) return errorResponse('Enter a valid email address.', 400, origin)
+  const inviteRole = body.role === undefined || body.role === null ? 'member' : body.role
+  if (inviteRole !== 'admin' && inviteRole !== 'member') return errorResponse('Choose a valid role.', 400, origin)
+  const email = normalizeEmail(body.email)
+  const workspace = await env.DB.prepare('SELECT name FROM workspaces WHERE id = ?').bind(workspaceId).first()
+  const id = crypto.randomUUID()
+  const token = randomToken()
+  const tokenHash = base64Url(await sha256(token))
+  const now = Date.now()
+  const expiresAt = now + 7 * 86400000
+  try {
+    await env.DB.prepare(
+      'INSERT INTO workspace_invites (id, workspace_id, email, role, token_hash, created_by, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).bind(id, workspaceId, email, inviteRole, tokenHash, session.userId, expiresAt).run()
+  } catch {
+    return errorResponse('An invite for this email already exists.', 409, origin)
+  }
+  const link = `https://outreach.kluzar.com/dashboard/team/?invite=${id}&token=${token}`
+  const sent = await sendBrevo(env, {
+    email,
+    subject: `You are invited to join ${workspace?.name ?? 'a workspace'} on Kluzar Outreach`,
+    text: `You have been invited to join the Kluzar Outreach workspace "${workspace?.name ?? ''}". Open this link to accept the invite (it expires in 7 days): ${link}`,
+    unsubscribeToken: null,
+    messageId: null,
+    tag: 'kluzar-outreach-invite',
+  })
+  if (!sent?.messageId) {
+    await env.DB.prepare('DELETE FROM workspace_invites WHERE id = ?').bind(id).run()
+    return errorResponse('Invite could not be sent. Please try again later.', 502, origin)
+  }
+  await logActivity(env, workspaceId, 'invite_sent', `${email} was invited to the workspace as ${inviteRole}.`)
+  return jsonResponse({ id, email, role: inviteRole, expires_at: expiresAt }, origin, 201)
+}
+
+async function acceptInvite(request, env, workspaceId, inviteId, session, origin) {
+  const body = await readJson(request)
+  if (!isObject(body) || typeof body.token !== 'string' || !body.token) return errorResponse('Invite could not be verified.', 400, origin)
+  const invite = await env.DB.prepare(
+    'SELECT id, workspace_id, email, role, token_hash, expires_at, accepted_at FROM workspace_invites WHERE id = ? AND workspace_id = ?',
+  ).bind(inviteId, workspaceId).first()
+  if (!invite) return errorResponse('Invite not found.', 404, origin)
+  const tokenHash = base64Url(await sha256(body.token))
+  if (!await constantTimeEqual(tokenHash, invite.token_hash)) return errorResponse('Invite could not be verified.', 401, origin)
+  if (invite.accepted_at) return errorResponse('This invite has already been used.', 409, origin)
+  if (invite.expires_at < Date.now()) return errorResponse('This invite has expired.', 410, origin)
+  if (session.email && normalizeEmail(session.email) !== invite.email) return errorResponse('This invite was sent to a different email address.', 403, origin)
+  const workspace = await env.DB.prepare('SELECT owner_user_id FROM workspaces WHERE id = ?').bind(workspaceId).first()
+  if (!workspace) return errorResponse('Workspace not found.', 404, origin)
+  if (workspace.owner_user_id === session.userId) return errorResponse('You already have access to this workspace.', 409, origin)
+  const now = Date.now()
+  await env.DB.batch([
+    env.DB.prepare(
+      'INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, role, invited_by, created_at) VALUES (?, ?, ?, ?, ?)',
+    ).bind(workspaceId, session.userId, invite.role, invite.email, now),
+    env.DB.prepare('UPDATE workspace_invites SET accepted_at = ? WHERE id = ? AND accepted_at IS NULL').bind(now, inviteId),
+  ])
+  return jsonResponse({ userId: session.userId, email: invite.email, role: invite.role, created_at: now }, origin)
+}
+
+async function updateMember(request, env, workspaceId, memberUserId, session, origin) {
+  const body = await readJson(request)
+  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  if (!isObject(body) || (body.role !== 'admin' && body.role !== 'member')) return errorResponse('Choose a valid role.', 400, origin)
+  const workspace = await env.DB.prepare('SELECT owner_user_id FROM workspaces WHERE id = ?').bind(workspaceId).first()
+  if (workspace && workspace.owner_user_id === memberUserId) return errorResponse('The workspace owner role cannot be changed.', 400, origin)
+  const row = await env.DB.prepare(
+    'UPDATE workspace_members SET role = ? WHERE workspace_id = ? AND user_id = ? RETURNING workspace_id, user_id, role, created_at',
+  ).bind(body.role, workspaceId, memberUserId).first()
+  if (!row) return errorResponse('Member not found.', 404, origin)
+  return jsonResponse({ userId: row.user_id, role: row.role, created_at: row.created_at }, origin)
+}
+
+async function removeMember(env, workspaceId, memberUserId, session, origin) {
+  if (!await ownsWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  const workspace = await env.DB.prepare('SELECT owner_user_id FROM workspaces WHERE id = ?').bind(workspaceId).first()
+  if (workspace && workspace.owner_user_id === memberUserId) return errorResponse('The workspace owner cannot be removed.', 400, origin)
+  const row = await env.DB.prepare(
+    'DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ? RETURNING user_id',
+  ).bind(workspaceId, memberUserId).first()
+  if (!row) return errorResponse('Member not found.', 404, origin)
+  return jsonResponse({ removed: true }, origin)
+}
+
+function spfRecordFor(senderType) {
+  if (senderType === 'outlook_oauth') return 'v=spf1 include:spf.protection.outlook.com -all'
+  if (senderType === 'brevo_default') return 'v=spf1 include:spf.brevo.com ~all'
+  return 'v=spf1 include:_spf.google.com ~all'
+}
+
+function dnsGuidance(domain, senderType) {
+  const spfRecord = spfRecordFor(senderType)
+  const dkimBody = domain === 'kluzar.com'
+    ? 'For kluzar.com via Brevo, add these CNAME records: b1.kluzar-com._domainkey points to b1.kluzar-com.dkim.brevo.com, and b2.kluzar-com._domainkey points to b2.kluzar-com.dkim.brevo.com.'
+    : 'Add the DKIM CNAME records provided by your mailbox provider. Your provider generates the selector and target values for you.'
+  const dmarcRecord = domain ? `v=DMARC1; p=none; rua=mailto:info@${domain}` : 'v=DMARC1; p=none; rua=mailto:info@your-domain'
+  return [
+    { title: 'SPF', body: `SPF tells receiving mail servers which services are allowed to send email for your domain. Add a TXT record for ${domain || 'your domain'} with this value: ${spfRecord}` },
+    { title: 'DKIM', body: `DKIM adds a digital signature to your emails so receivers can verify they really came from you. ${dkimBody}` },
+    { title: 'DMARC', body: `DMARC tells receivers what to do with mail that fails SPF or DKIM checks, and where to send reports. Add a TXT record for _dmarc.${domain || 'your-domain'} with this value: ${dmarcRecord}` },
+  ]
+}
+
+async function dohTxt(name) {
+  const url = new URL('https://cloudflare-dns.com/dns-query')
+  url.searchParams.set('name', name)
+  url.searchParams.set('type', 'TXT')
+  let result
+  try {
+    result = await fetch(url, {
+      headers: { Accept: 'application/dns-json' },
+      redirect: 'error',
+      signal: AbortSignal.timeout(5000),
+    })
+  } catch {
+    return { ok: false, records: [] }
+  }
+  if (!result.ok) return { ok: false, records: [] }
+  const data = await result.json().catch(() => null)
+  if (!isObject(data) || !Array.isArray(data.Answer)) return { ok: false, records: [] }
+  const records = []
+  for (const answer of data.Answer) {
+    if (answer.type !== 16 || typeof answer.data !== 'string') continue
+    records.push(answer.data.replaceAll('"', ''))
+  }
+  return { ok: true, records }
+}
+
+async function getDns(env, url, session, origin) {
+  const workspaceId = url.searchParams.get('workspaceId')
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  let sender = await env.DB.prepare(
+    'SELECT id, type, address FROM senders WHERE workspace_id = ? AND is_default = 1',
+  ).bind(workspaceId).first()
+  if (!sender) {
+    sender = await env.DB.prepare(
+      'SELECT id, type, address FROM senders WHERE workspace_id = ? ORDER BY created_at LIMIT 1',
+    ).bind(workspaceId).first()
+  }
+  const senderEmail = sender?.address ?? null
+  let domain = ''
+  if (sender && sender.type !== 'brevo_default') {
+    const parts = String(sender.address).split('@')
+    domain = parts.length === 2 ? parts[1].toLowerCase() : ''
+  } else if (sender) {
+    domain = 'kluzar.com'
+  }
+  const guidance = dnsGuidance(domain, sender?.type ?? null)
+  if (!domain) return jsonResponse({ domain: '', senderEmail, checks: [], guidance }, origin)
+  const spfRecord = spfRecordFor(sender?.type ?? null)
+  const dmarcRecord = `v=DMARC1; p=none; rua=mailto:info@${domain}`
+  const dkimExpected = domain === 'kluzar.com'
+    ? 'b1.kluzar-com._domainkey CNAME b1.kluzar-com.dkim.brevo.com; b2.kluzar-com._domainkey CNAME b2.kluzar-com.dkim.brevo.com'
+    : 'Add the DKIM CNAME records provided by your mailbox provider.'
+  const spfLookup = await dohTxt(domain)
+  const spfText = spfLookup.records.join(' ')
+  const spfCheck = !spfLookup.ok
+    ? { record: 'SPF', status: 'unknown', detail: 'DNS lookup could not be completed.', expected: spfRecord }
+    : spfText.includes('v=spf1')
+      ? { record: 'SPF', status: 'pass', detail: 'SPF record found.', expected: spfRecord }
+      : { record: 'SPF', status: 'fail', detail: `No SPF record was found for ${domain}.`, expected: spfRecord }
+  const dkimSelectors = ['default', 'google', 'dkim', 'selector1', 'selector2', 'b1', 'brevo']
+  let dkimFound = null
+  let dkimAnswered = false
+  for (const selector of dkimSelectors) {
+    const result = await dohTxt(`${selector}._domainkey.${domain}`)
+    if (!result.ok) continue
+    dkimAnswered = true
+    const text = result.records.join(' ')
+    if (text.includes('v=DKIM1') || text.includes('p=')) {
+      dkimFound = selector
+      break
+    }
+  }
+  const dkimCheck = dkimFound
+    ? { record: 'DKIM', status: 'pass', detail: `DKIM record found (selector "${dkimFound}").`, expected: dkimExpected }
+    : dkimAnswered
+      ? { record: 'DKIM', status: 'fail', detail: `No DKIM record was found for ${domain}.`, expected: dkimExpected }
+      : { record: 'DKIM', status: 'unknown', detail: 'DNS lookup could not be completed.', expected: dkimExpected }
+  const dmarcLookup = await dohTxt(`_dmarc.${domain}`)
+  const dmarcText = dmarcLookup.records.join(' ')
+  const dmarcCheck = !dmarcLookup.ok
+    ? { record: 'DMARC', status: 'unknown', detail: 'DNS lookup could not be completed.', expected: dmarcRecord }
+    : dmarcText.includes('v=DMARC1')
+      ? { record: 'DMARC', status: 'pass', detail: 'DMARC record found.', expected: dmarcRecord }
+      : { record: 'DMARC', status: 'fail', detail: `No DMARC record was found for ${domain}.`, expected: dmarcRecord }
+  return jsonResponse({ domain, senderEmail, checks: [spfCheck, dkimCheck, dmarcCheck], guidance }, origin)
+}
+
+async function validateWorkflowRules(env, workspaceId, rules) {
+  if (!Array.isArray(rules) || rules.length < 1 || rules.length > 20) return { error: 'Add between 1 and 20 workflow rules.' }
+  const seenIds = new Set()
+  const normalized = []
+  for (let index = 0; index < rules.length; index += 1) {
+    const rule = rules[index]
+    if (!isObject(rule) || !isObject(rule.condition) || !Array.isArray(rule.actions)) return { error: 'Each workflow rule needs a condition and actions.' }
+    const id = typeof rule.id === 'string' && rule.id.trim() ? rule.id.trim().slice(0, 100) : `rule-${index + 1}`
+    if (seenIds.has(id)) return { error: 'Workflow rule ids must be unique.' }
+    seenIds.add(id)
+    const conditionType = rule.condition.type
+    if (!['reply_contains', 'reply_any', 'no_reply_after_days'].includes(conditionType)) return { error: 'Choose a valid rule condition.' }
+    let value = null
+    if (conditionType === 'reply_contains') {
+      if (typeof rule.condition.value !== 'string' || rule.condition.value.length < 1 || rule.condition.value.length > 100) return { error: 'Reply text to match must be 1 to 100 characters.' }
+      value = rule.condition.value
+    } else if (conditionType === 'no_reply_after_days') {
+      if (!Number.isInteger(rule.condition.value) || rule.condition.value < 1 || rule.condition.value > 365) return { error: 'No-reply delay must be between 1 and 365 days.' }
+      value = rule.condition.value
+    }
+    if (rule.actions.length < 1 || rule.actions.length > 5) return { error: 'Each rule needs between 1 and 5 actions.' }
+    const actions = []
+    for (const action of rule.actions) {
+      if (!isObject(action) || !['move_to_list', 'send_email', 'change_status', 'follow_up_step', 'stop', 'notify'].includes(action.type)) return { error: 'Choose a valid rule action.' }
+      if (action.type === 'move_to_list') {
+        if (typeof action.listId !== 'string' || !action.listId) return { error: 'Choose a list to move the lead to.' }
+        const list = await env.DB.prepare('SELECT id FROM lead_lists WHERE id = ? AND workspace_id = ?').bind(action.listId, workspaceId).first()
+        if (!list) return { error: 'List not found.' }
+        actions.push({ type: 'move_to_list', listId: action.listId })
+      } else if (action.type === 'send_email') {
+        if (typeof action.templateId !== 'string' || !action.templateId) return { error: 'Choose a template to send.' }
+        const template = await env.DB.prepare('SELECT id FROM templates WHERE id = ? AND workspace_id = ?').bind(action.templateId, workspaceId).first()
+        if (!template) return { error: 'Template not found.' }
+        actions.push({ type: 'send_email', templateId: action.templateId })
+      } else if (action.type === 'change_status') {
+        if (!VALID_LEAD_STATUSES.has(action.status)) return { error: 'Choose a valid lead status.' }
+        actions.push({ type: 'change_status', status: action.status })
+      } else if (action.type === 'follow_up_step') {
+        if (!Number.isInteger(action.stepNo) || action.stepNo < 1 || action.stepNo > 50) return { error: 'Follow-up step must be between 1 and 50.' }
+        actions.push({ type: 'follow_up_step', stepNo: action.stepNo })
+      } else if (action.type === 'stop') {
+        actions.push({ type: 'stop' })
+      } else {
+        actions.push({ type: 'notify' })
+      }
+    }
+    normalized.push({ id, condition: { type: conditionType, value }, actions })
+  }
+  return { rules: normalized }
+}
+
+function workflowRow(row) {
+  let rules = []
+  try {
+    rules = JSON.parse(row.rules_json)
+  } catch {
+    rules = []
+  }
+  return { id: row.id, name: row.name, is_active: row.is_active !== 0, rules, created_at: row.created_at, updated_at: row.updated_at }
+}
+
+async function listWorkflows(env, url, session, origin) {
+  const workspaceId = url.searchParams.get('workspaceId')
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  const rows = await env.DB.prepare(
+    'SELECT id, name, is_active, rules_json, created_at, updated_at FROM workflows WHERE workspace_id = ? ORDER BY created_at DESC',
+  ).bind(workspaceId).all()
+  return jsonResponse((rows.results ?? []).map(workflowRow), origin)
+}
+
+async function createWorkflow(request, env, session, origin) {
+  const body = await readJson(request)
+  if (!isObject(body) || !await ownsWorkspace(env, body.workspaceId, session.userId)) return errorResponse('Enter valid workflow details.', 400, origin)
+  if (!safeText(body.name, 100)) return errorResponse('Enter a workflow name of 100 characters or fewer.', 400, origin)
+  const validated = await validateWorkflowRules(env, body.workspaceId, body.rules)
+  if (validated.error) return errorResponse(validated.error, 400, origin)
+  const id = crypto.randomUUID()
+  const now = Date.now()
+  await env.DB.prepare(
+    'INSERT INTO workflows (id, workspace_id, name, is_active, rules_json, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)',
+  ).bind(id, body.workspaceId, body.name.trim(), JSON.stringify(validated.rules), now, now).run()
+  return jsonResponse({ id, name: body.name.trim(), is_active: true, rules: validated.rules, created_at: now, updated_at: now }, origin, 201)
+}
+
+async function getWorkflow(env, workflowId, url, session, origin) {
+  const workspaceId = url.searchParams.get('workspaceId')
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  const row = await env.DB.prepare(
+    'SELECT id, name, is_active, rules_json, created_at, updated_at FROM workflows WHERE id = ? AND workspace_id = ?',
+  ).bind(workflowId, workspaceId).first()
+  if (!row) return errorResponse('Workflow not found.', 404, origin)
+  return jsonResponse(workflowRow(row), origin)
+}
+
+async function updateWorkflow(request, env, workflowId, session, origin) {
+  const body = await readJson(request)
+  if (!isObject(body)) return errorResponse('Enter valid workflow details.', 400, origin)
+  const existing = await env.DB.prepare(
+    'SELECT id, workspace_id, name, is_active, rules_json, created_at, updated_at FROM workflows WHERE id = ?',
+  ).bind(workflowId).first()
+  if (!existing) return errorResponse('Workflow not found.', 404, origin)
+  if (!await ownsWorkspace(env, existing.workspace_id, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  const name = body.name === undefined ? existing.name : body.name
+  if (!safeText(name, 100)) return errorResponse('Enter a workflow name of 100 characters or fewer.', 400, origin)
+  let isActive = existing.is_active !== 0
+  if (body.is_active !== undefined) {
+    if (typeof body.is_active !== 'boolean' && body.is_active !== 0 && body.is_active !== 1) return errorResponse('Choose whether the workflow is active.', 400, origin)
+    isActive = body.is_active === true || body.is_active === 1
+  }
+  let rules = []
+  try {
+    rules = JSON.parse(existing.rules_json)
+  } catch {
+    rules = []
+  }
+  if (body.rules !== undefined) {
+    const validated = await validateWorkflowRules(env, existing.workspace_id, body.rules)
+    if (validated.error) return errorResponse(validated.error, 400, origin)
+    rules = validated.rules
+  }
+  const now = Date.now()
+  await env.DB.prepare(
+    'UPDATE workflows SET name = ?, is_active = ?, rules_json = ?, updated_at = ? WHERE id = ?',
+  ).bind(name.trim(), isActive ? 1 : 0, JSON.stringify(rules), now, workflowId).run()
+  return jsonResponse({ id: workflowId, name: name.trim(), is_active: isActive, rules, created_at: existing.created_at, updated_at: now }, origin)
+}
+
+async function deleteWorkflow(env, workflowId, session, origin) {
+  const existing = await env.DB.prepare('SELECT workspace_id FROM workflows WHERE id = ?').bind(workflowId).first()
+  if (!existing) return errorResponse('Workflow not found.', 404, origin)
+  if (!await ownsWorkspace(env, existing.workspace_id, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  await env.DB.prepare('DELETE FROM workflows WHERE id = ?').bind(workflowId).run()
+  return noContentResponse(origin)
+}
+
+async function evaluateWorkflowRules(env, send, trigger, at, replyBody) {
+  const workspaceId = send.workspace_id ?? (await env.DB.prepare(
+    'SELECT workspace_id FROM campaigns WHERE id = ?',
+  ).bind(send.campaign_id).first())?.workspace_id
+  if (!workspaceId) return
+  const workflows = await env.DB.prepare(
+    'SELECT id, name, rules_json FROM workflows WHERE workspace_id = ? AND is_active = 1 ORDER BY created_at',
+  ).bind(workspaceId).all()
+  for (const workflow of workflows.results ?? []) {
+    let rules = []
+    try {
+      rules = JSON.parse(workflow.rules_json)
+    } catch {
+      continue
+    }
+    for (const rule of rules) {
+      if (!isObject(rule) || !isObject(rule.condition) || !Array.isArray(rule.actions)) continue
+      const condition = rule.condition
+      let matched = false
+      if (trigger === 'reply' && condition.type === 'reply_any') matched = true
+      if (trigger === 'reply' && condition.type === 'reply_contains' && typeof replyBody === 'string' && typeof condition.value === 'string') {
+        matched = replyBody.toLowerCase().includes(condition.value.toLowerCase())
+      }
+      if (trigger === 'no_reply' && condition.type === 'no_reply_after_days' && Number.isInteger(condition.value)) {
+        matched = at - Number(send.sent_at) >= condition.value * 86400000
+      }
+      if (!matched) continue
+      const claim = await env.DB.prepare(
+        'INSERT OR IGNORE INTO workflow_executions (id, workflow_id, send_id, rule_id, created_at) VALUES (?, ?, ?, ?, ?)',
+      ).bind(crypto.randomUUID(), workflow.id, send.id, rule.id, at).run()
+      if ((claim.meta?.changes ?? 0) === 0) continue
+      await executeWorkflowActions(env, send, workspaceId, workflow, rule, trigger, at)
+    }
+  }
+}
+
+async function executeWorkflowActions(env, send, workspaceId, workflow, rule, trigger, at) {
+  const lead = await env.DB.prepare(
+    'SELECT id, email, first_name, company, status FROM leads WHERE id = ?',
+  ).bind(send.lead_id).first()
+  if (!lead) return
+  const campaign = await env.DB.prepare(
+    'SELECT id, name, sender_id FROM campaigns WHERE id = ?',
+  ).bind(send.campaign_id).first()
+  for (const action of rule.actions) {
+    if (action.type === 'move_to_list') {
+      await env.DB.prepare(
+        'INSERT OR IGNORE INTO lead_list_members (list_id, lead_id, created_at) VALUES (?, ?, ?)',
+      ).bind(action.listId, lead.id, at).run()
+    } else if (action.type === 'change_status' && VALID_LEAD_STATUSES.has(action.status)) {
+      await env.DB.prepare('UPDATE leads SET status = ? WHERE id = ?').bind(action.status, lead.id).run()
+      if (action.status === 'unsubscribed' || action.status === 'bounced') {
+        await env.DB.prepare(
+          `INSERT INTO suppressions (id, workspace_id, email, reason, created_at)
+           VALUES (?, ?, ?, ?, ?) ON CONFLICT(workspace_id, email) DO UPDATE SET reason = excluded.reason`,
+        ).bind(crypto.randomUUID(), workspaceId, lead.email, action.status, at).run()
+      }
+    } else if (action.type === 'stop') {
+      await env.DB.prepare(
+        `UPDATE sends SET status = 'stopped' WHERE campaign_id = ? AND lead_id = ? AND status = 'queued'`,
+      ).bind(send.campaign_id, lead.id).run()
+    } else if (action.type === 'notify') {
+      const workspace = await env.DB.prepare(
+        'SELECT id, owner_email FROM workspaces WHERE id = ?',
+      ).bind(workspaceId).first()
+      if (workspace) await notifyWorkspace(env, workspace, `Workflow "${workflow.name}" triggered a notification for ${lead.email}.`)
+    } else if (action.type === 'follow_up_step') {
+      if (!campaign) continue
+      const next = await env.DB.prepare(
+        'SELECT step_no, delay_days FROM sequences WHERE campaign_id = ? AND step_no = ?',
+      ).bind(send.campaign_id, action.stepNo).first()
+      if (!next) continue
+      const replied = trigger === 'reply'
+      const dueAt = replied ? at : at + Number(next.delay_days) * 86400000
+      await env.DB.prepare(
+        `INSERT INTO sends
+         (id, campaign_id, lead_id, sequence_step, status, scheduled_at, is_reply_followup, created_at)
+         VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+         ON CONFLICT(campaign_id, lead_id, sequence_step) DO UPDATE SET
+           status = 'queued',
+           scheduled_at = MIN(scheduled_at, excluded.scheduled_at),
+           is_reply_followup = MAX(is_reply_followup, excluded.is_reply_followup)
+         WHERE sends.status = 'queued' OR (excluded.is_reply_followup = 1 AND sends.status = 'stopped')`,
+      ).bind(crypto.randomUUID(), send.campaign_id, lead.id, next.step_no, dueAt, replied ? 1 : 0, at).run()
+    } else if (action.type === 'send_email') {
+      await executeWorkflowSendEmail(env, send, workspaceId, workflow, action, lead, campaign, at)
+    }
+  }
+}
+
+async function executeWorkflowSendEmail(env, send, workspaceId, workflow, action, lead, campaign, at) {
+  if (!campaign?.sender_id) return
+  if (['unsubscribed', 'bounced'].includes(lead.status)) return
+  const suppressed = await env.DB.prepare('SELECT id FROM suppressions WHERE workspace_id = ? AND email = ?')
+    .bind(workspaceId, lead.email).first()
+  if (suppressed) return
+  if (await dailySendCount(env, workspaceId, at) >= DAILY_SEND_LIMIT) return
+  const template = await env.DB.prepare(
+    'SELECT subject, text, html FROM templates WHERE id = ? AND workspace_id = ?',
+  ).bind(action.templateId, workspaceId).first()
+  if (!template) return
+  const sender = await env.DB.prepare(
+    'SELECT id, type, address, display_name, credentials_ref, credentials_expires_at FROM senders WHERE id = ? AND workspace_id = ?',
+  ).bind(campaign.sender_id, workspaceId).first()
+  if (!sender || !['gmail_oauth', 'outlook_oauth'].includes(sender.type)) return
+  const credentials = await refreshSender(env, sender)
+  if (!credentials) return
+  const leadVars = { first_name: lead.first_name ?? '', company: lead.company ?? '' }
+  const token = randomToken()
+  try {
+    await env.DB.prepare(
+      'INSERT INTO unsubscribe_tokens (token_hash, workspace_id, lead_id, email, expires_at) VALUES (?, ?, ?, ?, ?)',
+    ).bind(base64Url(await sha256(token)), workspaceId, lead.id, lead.email, at + 31536000000).run()
+  } catch {
+    return
+  }
+  const message = {
+    email: lead.email,
+    subject: renderTemplate(template.subject, leadVars),
+    text: renderTemplate(template.text, leadVars),
+    html: template.html ? renderTemplate(template.html, leadVars) : null,
+    unsubscribeToken: token,
+  }
+  const providerResult = sender.type === 'gmail_oauth'
+    ? await sendGmail(env, sender, credentials, message)
+    : await sendMicrosoft(sender, credentials, message)
+  if (!providerResult) return
+  await logActivity(env, workspaceId, 'workflow_email_sent', `Workflow "${workflow.name}" sent "${template.subject}" to ${lead.email}.`)
+  const workspace = await env.DB.prepare('SELECT id, owner_email FROM workspaces WHERE id = ?').bind(workspaceId).first()
+  if (workspace) await notifyWorkspace(env, workspace, `Workflow "${workflow.name}" sent an email to ${lead.email}.`)
+}
+
+async function listAbTests(env, url, session, origin) {
+  const workspaceId = url.searchParams.get('workspaceId')
+  if (!await canAccessWorkspace(env, workspaceId, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  const rows = await env.DB.prepare(
+    `SELECT t.id, t.campaign_id, c.name AS campaign_name, t.name, t.status, t.split_percent, t.winner_variant_id, t.created_at
+     FROM ab_tests t JOIN campaigns c ON c.id = t.campaign_id
+     WHERE t.workspace_id = ? ORDER BY t.created_at DESC`,
+  ).bind(workspaceId).all()
+  return jsonResponse(rows.results ?? [], origin)
+}
+
+function abTestRow(row, variants) {
+  return {
+    id: row.id,
+    campaign_id: row.campaign_id,
+    campaign_name: row.campaign_name ?? null,
+    name: row.name,
+    status: row.status,
+    split_percent: row.split_percent,
+    winner_variant_id: row.winner_variant_id ?? null,
+    created_at: row.created_at,
+    variants: (variants ?? []).map((variant) => ({
+      id: variant.id,
+      label: variant.label,
+      subject: variant.subject,
+      body_template: variant.body_template,
+      body_html: variant.body_html ?? null,
+      created_at: variant.created_at,
+    })),
+  }
+}
+
+async function abTestDetail(env, testId) {
+  const test = await env.DB.prepare(
+    `SELECT t.id, t.campaign_id, c.name AS campaign_name, t.workspace_id, t.name, t.status, t.split_percent, t.winner_variant_id, t.created_at
+     FROM ab_tests t JOIN campaigns c ON c.id = t.campaign_id WHERE t.id = ?`,
+  ).bind(testId).first()
+  if (!test) return null
+  const variants = await env.DB.prepare(
+    'SELECT id, label, subject, body_template, body_html, created_at FROM ab_variants WHERE ab_test_id = ? ORDER BY label',
+  ).bind(testId).all()
+  return { test, variants: variants.results ?? [] }
+}
+
+async function createAbTest(request, env, session, origin) {
+  const body = await readJson(request)
+  if (!isObject(body) || !await ownsWorkspace(env, body.workspaceId, session.userId)) return errorResponse('Enter valid A/B test details.', 400, origin)
+  if (!safeText(body.name, 100) || !safeText(body.campaignId, 100)) return errorResponse('Enter a valid A/B test name and campaign.', 400, origin)
+  const splitPercent = body.splitPercent === undefined || body.splitPercent === null ? 50 : body.splitPercent
+  if (!Number.isInteger(splitPercent) || splitPercent < 10 || splitPercent > 90) return errorResponse('Split percent must be between 10 and 90.', 400, origin)
+  if (!isObject(body.variantB) || !safeText(body.variantB.subject, 200) || !safeText(body.variantB.bodyTemplate, 10000)) {
+    return errorResponse('Enter a valid variant B subject and body.', 400, origin)
+  }
+  let variantBHtml = null
+  if (body.variantB.bodyHtml !== undefined && body.variantB.bodyHtml !== null) {
+    if (typeof body.variantB.bodyHtml !== 'string' || body.variantB.bodyHtml.length > 100000) return errorResponse('Variant B HTML must be 100,000 characters or fewer.', 400, origin)
+    variantBHtml = sanitizeHtml(body.variantB.bodyHtml)
+  }
+  const campaign = await env.DB.prepare(
+    'SELECT id, name, status FROM campaigns WHERE id = ? AND workspace_id = ?',
+  ).bind(body.campaignId, body.workspaceId).first()
+  if (!campaign) return errorResponse('Campaign not found.', 404, origin)
+  if (!['draft', 'active'].includes(campaign.status)) return errorResponse('A/B tests can only run on draft or active campaigns.', 409, origin)
+  const running = await env.DB.prepare(
+    "SELECT id FROM ab_tests WHERE campaign_id = ? AND status = 'running'",
+  ).bind(body.campaignId).first()
+  if (running) return errorResponse('This campaign already has a running A/B test.', 409, origin)
+  const step = await env.DB.prepare(
+    'SELECT subject, body_template, body_html FROM sequences WHERE campaign_id = ? AND step_no = 1',
+  ).bind(body.campaignId).first()
+  if (!step) return errorResponse('Add a first sequence step before testing.', 409, origin)
+  const id = crypto.randomUUID()
+  const now = Date.now()
+  const variantAId = crypto.randomUUID()
+  const variantBId = crypto.randomUUID()
+  await env.DB.batch([
+    env.DB.prepare(
+      'INSERT INTO ab_tests (id, campaign_id, workspace_id, name, status, split_percent, winner_variant_id, created_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)',
+    ).bind(id, body.campaignId, body.workspaceId, body.name.trim(), 'running', splitPercent, now),
+    env.DB.prepare(
+      "INSERT INTO ab_variants (id, ab_test_id, label, subject, body_template, body_html, created_at) VALUES (?, ?, 'A', ?, ?, ?, ?)",
+    ).bind(variantAId, id, step.subject, step.body_template, step.body_html ?? null, now),
+    env.DB.prepare(
+      "INSERT INTO ab_variants (id, ab_test_id, label, subject, body_template, body_html, created_at) VALUES (?, ?, 'B', ?, ?, ?, ?)",
+    ).bind(variantBId, id, body.variantB.subject.trim(), body.variantB.bodyTemplate, variantBHtml, now),
+  ])
+  const detail = await abTestDetail(env, id)
+  return jsonResponse(abTestRow(detail.test, detail.variants), origin, 201)
+}
+
+async function getAbTest(env, testId, url, session, origin) {
+  const detail = await abTestDetail(env, testId)
+  if (!detail) return errorResponse('A/B test not found.', 404, origin)
+  if (!await canAccessWorkspace(env, detail.test.workspace_id, session.userId)) return errorResponse('A/B test not found.', 404, origin)
+  return jsonResponse(abTestRow(detail.test, detail.variants), origin)
+}
+
+async function updateAbTest(request, env, testId, session, origin) {
+  const body = await readJson(request)
+  if (!isObject(body)) return errorResponse('Enter valid A/B test details.', 400, origin)
+  const detail = await abTestDetail(env, testId)
+  if (!detail) return errorResponse('A/B test not found.', 404, origin)
+  if (!await ownsWorkspace(env, detail.test.workspace_id, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  let winnerId = null
+  if (body.winnerVariantId !== undefined && body.winnerVariantId !== null) {
+    const winner = detail.variants.find((variant) => variant.id === body.winnerVariantId)
+    if (!winner) return errorResponse('Choose a variant from this test as the winner.', 400, origin)
+    winnerId = winner.id
+  }
+  const status = body.status === undefined || body.status === null
+    ? (winnerId ? 'complete' : detail.test.status)
+    : body.status
+  if (status !== 'running' && status !== 'complete') return errorResponse('Choose a valid test status.', 400, origin)
+  const finalWinnerId = status === 'complete' ? (winnerId ?? detail.test.winner_variant_id) : null
+  await env.DB.prepare(
+    'UPDATE ab_tests SET status = ?, winner_variant_id = ? WHERE id = ?',
+  ).bind(status, finalWinnerId, testId).run()
+  if (finalWinnerId) {
+    const winner = detail.variants.find((variant) => variant.id === finalWinnerId)
+    if (winner) {
+      await env.DB.prepare(
+        'UPDATE sequences SET subject = ?, body_template = ?, body_html = ? WHERE campaign_id = ? AND step_no = 1',
+      ).bind(winner.subject, winner.body_template, winner.body_html ?? null, detail.test.campaign_id).run()
+    }
+  }
+  const updated = await abTestDetail(env, testId)
+  return jsonResponse(abTestRow(updated.test, updated.variants), origin)
+}
+
+async function deleteAbTest(env, testId, session, origin) {
+  const detail = await abTestDetail(env, testId)
+  if (!detail) return errorResponse('A/B test not found.', 404, origin)
+  if (!await ownsWorkspace(env, detail.test.workspace_id, session.userId)) return errorResponse('Workspace not found.', 404, origin)
+  await env.DB.prepare('DELETE FROM ab_tests WHERE id = ?').bind(testId).run()
+  return noContentResponse(origin)
+}
+
+async function getAbTestStats(env, testId, session, origin) {
+  const detail = await abTestDetail(env, testId)
+  if (!detail) return errorResponse('A/B test not found.', 404, origin)
+  if (!await canAccessWorkspace(env, detail.test.workspace_id, session.userId)) return errorResponse('A/B test not found.', 404, origin)
+  const variants = []
+  for (const variant of detail.variants) {
+    const row = await env.DB.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM sends WHERE ab_variant_id = ? AND sent_at IS NOT NULL) AS sent,
+         (SELECT COUNT(DISTINCT e.send_id) FROM events e JOIN sends s ON s.id = e.send_id WHERE s.ab_variant_id = ? AND s.sent_at IS NOT NULL AND e.type = 'opened') AS opened,
+         (SELECT COUNT(DISTINCT e.send_id) FROM events e JOIN sends s ON s.id = e.send_id WHERE s.ab_variant_id = ? AND s.sent_at IS NOT NULL AND e.type = 'replied') AS replied`,
+    ).bind(variant.id, variant.id, variant.id).first()
+    const sent = Number(row?.sent ?? 0)
+    const opened = Number(row?.opened ?? 0)
+    const replied = Number(row?.replied ?? 0)
+    variants.push({
+      id: variant.id,
+      label: variant.label,
+      sent,
+      opened,
+      replied,
+      openRate: sent > 0 ? Math.round((opened / sent) * 1000) / 10 : null,
+      replyRate: sent > 0 ? Math.round((replied / sent) * 1000) / 10 : null,
+    })
+  }
+  return jsonResponse({ variants }, origin)
+}
+
+async function servePublicImage(env, fileId) {
+  const file = await env.DB.prepare(
+    'SELECT id, r2_key FROM files WHERE id = ? AND kind = ?',
+  ).bind(fileId, 'template_image').first()
+  if (!file) return errorResponse('Not found.', 404)
+  const object = await env.FILES.get(file.r2_key)
+  const contentType = object?.httpMetadata?.contentType
+  if (!object || !['image/png', 'image/jpeg', 'image/gif'].includes(contentType)) return errorResponse('Not found.', 404)
+  return new Response(object.body, {
+    headers: {
+      'Cache-Control': 'public, max-age=31536000, immutable',
+      'Content-Type': contentType,
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+    },
+  })
+}
+
 export {
   completeUpload,
   constantTimeEqual,
@@ -3006,8 +4374,15 @@ export {
   createR2PresignedPutUrl,
   decryptToken,
   encryptToken,
+  evaluateWorkflowRules,
   isValidEmail,
   normalizedBrevoEvent,
   parseCsv,
+  processNoReplyBranches,
+  rampWarmup,
+  recordReply,
   renderTemplate,
+  runScheduler,
+  sendDueMessages,
+  warmupCapReached,
 }
