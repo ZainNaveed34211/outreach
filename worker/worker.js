@@ -2304,7 +2304,6 @@ async function exchangeOAuth(request, env, provider, session, origin) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
       body: parameters,
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
     })
   } catch {
     return errorResponse('The mailbox provider could not be reached. Please try again.', 502, origin)
@@ -2367,7 +2366,7 @@ async function googleIdentity(env, idToken, nonce) {
   const url = new URL('https://oauth2.googleapis.com/tokeninfo')
   url.searchParams.set('id_token', idToken)
   try {
-    const result = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(5000) })
+    const result = await fetch(url, { redirect: 'error' })
     if (!result.ok) return null
     const identity = await result.json()
     if (
@@ -2397,7 +2396,6 @@ async function microsoftIdentity(env, idToken, nonce) {
     if (claims.exp < now || claims.nbf > now || !safeText(claims.tid, 100)) return null
     const keysResponse = await fetch('https://login.microsoftonline.com/common/discovery/v2.0/keys', {
       redirect: 'error',
-      signal: AbortSignal.timeout(5000),
     })
     if (!keysResponse.ok) return null
     const keySet = await keysResponse.json()
@@ -2445,7 +2443,6 @@ async function refreshSender(env, sender) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
       body: new URLSearchParams(fields),
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
     })
     if (!response.ok) return null
     refreshed = await response.json()
@@ -2508,7 +2505,6 @@ async function sendBrevo(env, message) {
       },
       body: JSON.stringify(payload),
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
     })
     if (!response.ok) return null
     result = await response.json()
@@ -2567,7 +2563,6 @@ async function sendGmail(env, sender, credentials, message) {
       headers: { Authorization: `Bearer ${credentials.accessToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ raw: encodeMimeBody(raw), ...(message.threadId ? { threadId: message.threadId } : {}) }),
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
     })
     if (!response.ok) return null
     const result = await response.json()
@@ -2603,7 +2598,6 @@ async function sendMicrosoft(sender, credentials, message) {
         internetMessageHeaders: headers,
       }),
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
     })
     if (!created.ok) return null
     const draft = await created.json()
@@ -2611,7 +2605,6 @@ async function sendMicrosoft(sender, credentials, message) {
       method: 'POST',
       headers: { Authorization: `Bearer ${credentials.accessToken}` },
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
     })
     if (!sent.ok) return null
     return { messageId: draft.id, threadId: draft.conversationId ?? null }
@@ -2631,7 +2624,6 @@ async function sendMicrosoftReply(sender, credentials, message) {
       },
       body: JSON.stringify({}),
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
     })
     if (!created.ok) return null
     draft = await created.json()
@@ -2647,14 +2639,12 @@ async function sendMicrosoftReply(sender, credentials, message) {
       },
       body: JSON.stringify({ body: { contentType: 'Text', content: message.text } }),
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
     })
     if (!updated.ok) return null
     const sent = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(draft.id)}/send`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${credentials.accessToken}` },
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
     })
     if (!sent.ok) return null
     return { messageId: draft.id, threadId: draft.conversationId ?? null }
@@ -2718,7 +2708,6 @@ async function verifyBrevoEvent(env, payload, eventInfo) {
     upstream = await fetch(url, {
       headers: { 'api-key': env.BREVO_API_KEY, Accept: 'application/json' },
       redirect: 'error',
-      signal: AbortSignal.timeout(8000),
     })
   } catch {
     return false
@@ -2887,7 +2876,7 @@ async function findReply(env, send, now) {
     try {
       response = await fetch(
         `https://gmail.googleapis.com/gmail/v1/users/me/threads/${encodeURIComponent(send.provider_thread_id)}?format=full`,
-        { headers: { Authorization: `Bearer ${credentials.accessToken}` }, redirect: 'error', signal: AbortSignal.timeout(8000) },
+        { headers: { Authorization: `Bearer ${credentials.accessToken}` }, redirect: 'error' },
       )
     } catch {
       return null
@@ -2920,7 +2909,6 @@ async function findReply(env, send, now) {
         Prefer: 'outlook.body-content-type="text"',
       },
       redirect: 'error',
-      signal: AbortSignal.timeout(8000),
     })
   } catch {
     return null
@@ -3849,7 +3837,6 @@ async function dohTxt(name) {
     result = await fetch(url, {
       headers: { Accept: 'application/dns-json' },
       redirect: 'error',
-      signal: AbortSignal.timeout(5000),
     })
   } catch {
     return { ok: false, records: [] }
