@@ -1581,6 +1581,14 @@ function sqliteEnv(seed = {}) {
       if (!/duplicate column name/i.test(error.message)) throw error
     }
   }
+  const failureReasonMigration = readFileSync(new URL('./migrations-2026-11-13-send-failure-reason.sql', import.meta.url), 'utf8')
+  for (const statement of failureReasonMigration.split(/;\s*\n/).map((part) => part.trim()).filter(Boolean)) {
+    try {
+      db.exec(statement)
+    } catch (error) {
+      if (!/duplicate column name/i.test(error.message)) throw error
+    }
+  }
   const accounts = new DatabaseSync(':memory:')
   accounts.exec('CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT NOT NULL, status TEXT NOT NULL, email_verified INTEGER NOT NULL); CREATE TABLE sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL);')
   accounts.prepare('INSERT INTO users (id, email, status, email_verified) VALUES (?, ?, ?, ?)').run('user-1', 'user@example.com', 'active', 1)
@@ -1683,6 +1691,7 @@ test('sqlite shim applies schema and feature migration with all new tables and c
   assert.ok(sequenceColumns.includes('template_id'))
   const sendColumns = db.prepare('PRAGMA table_info(sends)').all().map((row) => row.name)
   assert.ok(sendColumns.includes('ab_variant_id'))
+  assert.ok(sendColumns.includes('failure_reason'))
   const campaignColumns = db.prepare('PRAGMA table_info(campaigns)').all().map((row) => row.name)
   assert.ok(campaignColumns.includes('workflow_id'))
   const warmupColumns = db.prepare('PRAGMA table_info(warmup_state)').all().map((row) => row.name)
@@ -2551,4 +2560,111 @@ test('paste adds only valid new emails and reports duplicates invalid suppressed
   assert.equal(empty.status, 400)
   const wrongWorkspace = await worker.fetch(authedRequest('POST', '/v1/lists/list-1/leads/paste', { workspaceId: 'ws-2', text: 'x@example.com' }), env, { waitUntil() {} })
   assert.equal(wrongWorkspace.status, 400)
+})
+
+test('test send returns a plain reason when the provider rejects it or cannot be reached', async () => {
+  const { env, db } = sqliteEnv({ brevoApiKey: 'brevo-test-key' })
+  sqWorkspace(db)
+  let rejected
+  await withFetch(async (url) => {
+    if (String(url).includes('api.brevo.com')) return { ok: false, status: 401, async json() { return {} } }
+    throw new Error(`unexpected fetch ${url}`)
+  }, async () => {
+    rejected = await worker.fetch(authedRequest('POST', '/v1/test/send', { email: 'user@example.com' }), env, { waitUntil() {} })
+  })
+  assert.equal(rejected.status, 502)
+  const rejectedBody = await rejected.json()
+  assert.equal(rejectedBody.error, 'Test email could not be sent. Please try again later.')
+  assert.equal(rejectedBody.reason, 'The email provider rejected the sign-in details. Please check the sender setup and try again.')
+  assert.ok(!/brevo|api-key|401|http/i.test(rejectedBody.reason))
+  let unreachable
+  await withFetch(async (url) => {
+    if (String(url).includes('api.brevo.com')) throw new Error('boom')
+    throw new Error(`unexpected fetch ${url}`)
+  }, async () => {
+    unreachable = await worker.fetch(authedRequest('POST', '/v1/test/send', { email: 'user@example.com' }), env, { waitUntil() {} })
+  })
+  assert.equal(unreachable.status, 502)
+  assert.equal((await unreachable.json()).reason, 'The email provider could not be reached. Please try again later.')
+  let sent
+  await withFetch(async (url) => {
+    if (String(url).includes('api.brevo.com')) return { ok: true, async json() { return { messageId: 'brevo-msg-1' } } }
+    throw new Error(`unexpected fetch ${url}`)
+  }, async () => {
+    sent = await worker.fetch(authedRequest('POST', '/v1/test/send', { email: 'user@example.com' }), env, { waitUntil() {} })
+  })
+  assert.equal(sent.status, 202)
+  assert.equal((await sent.json()).data.queued, true)
+})
+
+test('campaign send failure records a plain reason and a later success clears it', async () => {
+  const { env, db } = sqliteEnv()
+  sqWorkspace(db)
+  sqList(db)
+  sqSender(db)
+  sqCampaign(db, { status: 'active' })
+  sqSequence(db)
+  sqLead(db)
+  const now = Date.now()
+  sqSend(db, { id: 'send-queued', lead_id: 'lead-1', sequence_step: 1, status: 'queued', scheduled_at: now - 1000, sent_at: null, created_at: now - 1000 })
+  const ciphertext = await encryptToken(env, { accessToken: 'mailbox-token', refreshToken: 'mailbox-refresh', expiresAt: Date.now() + 3600000 })
+  db.prepare('UPDATE senders SET credentials_ref = ? WHERE id = ?').run(ciphertext, 'sender-1')
+  await withFetch(async (url) => {
+    if (String(url).includes('gmail.googleapis.com/gmail/v1/users/me/messages/send')) {
+      return { ok: false, status: 429, async json() { return {} } }
+    }
+    throw new Error(`unexpected fetch ${url}`)
+  }, async () => {
+    await sendDueMessages(env, now)
+  })
+  const failed = db.prepare("SELECT status, failure_reason FROM sends WHERE id = 'send-queued'").get()
+  assert.equal(failed.status, 'failed')
+  assert.equal(failed.failure_reason, 'The email provider is busy. Please try again later.')
+  assert.ok(!/gmail|429|http/i.test(failed.failure_reason))
+  sqLead(db, { id: 'lead-2', email: 'bo@example.com', first_name: 'Bo', company: 'Beta' })
+  sqSend(db, { id: 'send-queued-2', lead_id: 'lead-2', sequence_step: 1, status: 'queued', scheduled_at: now - 1000, sent_at: null, created_at: now - 1000 })
+  await withFetch(async (url) => {
+    if (String(url).includes('gmail.googleapis.com/gmail/v1/users/me/messages/send')) {
+      return { ok: true, async json() { return { id: 'gmail-msg-2', threadId: 'thread-2' } } }
+    }
+    throw new Error(`unexpected fetch ${url}`)
+  }, async () => {
+    await sendDueMessages(env, Date.now())
+  })
+  const sent = db.prepare("SELECT status, failure_reason FROM sends WHERE id = 'send-queued-2'").get()
+  assert.equal(sent.status, 'sent')
+  assert.equal(sent.failure_reason, null)
+  const sends = await worker.fetch(authedRequest('GET', '/v1/campaigns/camp-1/sends?workspaceId=ws-1'), env, { waitUntil() {} })
+  assert.equal(sends.status, 200)
+  const rows = (await sends.json()).data
+  assert.equal(rows.length, 2)
+  const failedRow = rows.find((row) => row.id === 'send-queued')
+  assert.equal(failedRow.status, 'failed')
+  assert.equal(failedRow.failure_reason, 'The email provider is busy. Please try again later.')
+  assert.equal(failedRow.email, 'ada@example.com')
+  const timeline = await worker.fetch(authedRequest('GET', '/v1/leads/lead-1/timeline?workspaceId=ws-1'), env, { waitUntil() {} })
+  const failedEvent = (await timeline.json()).data.timeline.find((event) => event.type === 'failed')
+  assert.ok(failedEvent)
+  assert.equal(failedEvent.failure_reason, 'The email provider is busy. Please try again later.')
+  const stats = await worker.fetch(authedRequest('GET', '/v1/campaigns/camp-1/stats.csv?workspaceId=ws-1'), env, { waitUntil() {} })
+  const csv = await stats.text()
+  assert.ok(csv.includes('failure_reason'))
+  assert.ok(csv.includes('The email provider is busy. Please try again later.'))
+})
+
+test('suppressed lead stops a queued send with a plain reason', async () => {
+  const { env, db } = sqliteEnv()
+  sqWorkspace(db)
+  sqList(db)
+  sqSender(db)
+  sqCampaign(db, { status: 'active' })
+  sqSequence(db)
+  sqLead(db)
+  const now = Date.now()
+  sqSend(db, { id: 'send-queued', lead_id: 'lead-1', sequence_step: 1, status: 'queued', scheduled_at: now - 1000, sent_at: null, created_at: now - 1000 })
+  db.prepare("INSERT INTO suppressions (id, workspace_id, email, reason, created_at) VALUES ('sup-1', 'ws-1', 'ada@example.com', 'unsubscribed', 1000)").run()
+  await sendDueMessages(env, now)
+  const stopped = db.prepare("SELECT status, failure_reason FROM sends WHERE id = 'send-queued'").get()
+  assert.equal(stopped.status, 'stopped')
+  assert.equal(stopped.failure_reason, 'This address is suppressed and cannot receive mail.')
 })

@@ -482,6 +482,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .launch-confirm { display: inline-flex; align-items: center; gap: 5px; color: #76768a; font-size: 9px; }
 .launch-confirm input { accent-color: var(--navy); }
 .lead-row { gap: 10px; }
+.recipient-row { gap: 12px; }
+.recipient-row > div { display: grid; gap: 5px; min-width: 0; }
+.recipient-row > span { text-align: right; max-width: 60%; }
+.failed-reason { color: #b3261e !important; font-size: 10px !important; line-height: 1.5; overflow-wrap: anywhere; }
 .lead-row > div { display: grid; gap: 5px; min-width: 0; }
 .lead-row select { max-width: 145px; border: 1px solid #e5e5ee; border-radius: 6px; padding: 6px; color: #65657a; background: #fff; font-size: 9px; }
 .status-pill { flex: 0 0 auto; padding: 6px 9px; border-radius: 12px; color: #5d529f !important; background: #f2f0ff; font-size: 8px !important; }
@@ -599,6 +603,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 [data-theme="dark"] .button-outline { border-color: #3a3a68; color: #e8e7f5; background: transparent; }
 [data-theme="dark"] .form-panel input, [data-theme="dark"] .form-panel select, [data-theme="dark"] .form-panel textarea, [data-theme="dark"] .inline-form input, [data-theme="dark"] .form-grid input, [data-theme="dark"] .form-grid select, [data-theme="dark"] .test-panel select, [data-theme="dark"] .filter-bar input, [data-theme="dark"] .filter-bar select, [data-theme="dark"] .bulk-bar select, [data-theme="dark"] .preview-lead-select select, [data-theme="dark"] .schedule-form input, [data-theme="dark"] .reply-composer select, [data-theme="dark"] .reply-composer textarea { background: #23234c; border-color: #3a3a68; color: #e8e7f5; }
 [data-theme="dark"] .form-panel label, [data-theme="dark"] .inline-form label, [data-theme="dark"] .form-grid label, [data-theme="dark"] .reply-composer label, [data-theme="dark"] .schedule-form label, [data-theme="dark"] .preview-lead-select { color: #b9b8d8; }
+[data-theme="dark"] .failed-reason { color: #ff8a80 !important; }
 [data-theme="dark"] .group-card { border-color: #3a3a68; background: transparent; }
 [data-theme="dark"] .group-card:hover { border-color: #7c5cff; }
 [data-theme="dark"] .group-card.active { border-color: #7c5cff; background: #2a2560; }

@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS sends (
   sending_at INTEGER,
   is_reply_followup INTEGER NOT NULL DEFAULT 0,
   ab_variant_id TEXT REFERENCES ab_variants(id) ON DELETE SET NULL,
+  failure_reason TEXT,
   created_at INTEGER NOT NULL,
   UNIQUE (campaign_id, lead_id, sequence_step)
 );

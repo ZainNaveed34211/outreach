@@ -243,8 +243,24 @@ function response(body, status, origin) {
   return new Response(JSON.stringify(body), { status, headers })
 }
 
-function errorResponse(message, status, origin) {
-  return response({ ok: false, error: message }, status, origin)
+function errorResponse(message, status, origin, extra) {
+  return response({ ok: false, error: message, ...(extra ?? {}) }, status, origin)
+}
+
+function providerFailureReason(status) {
+  if (status === 401 || status === 403) return 'The email provider rejected the sign-in details. Please check the sender setup and try again.'
+  if (status === 429) return 'The email provider is busy. Please try again later.'
+  if (status === 400 || status === 422) return 'The email provider rejected this message. Please check the recipient address and try again.'
+  if (status >= 500) return 'The email provider had a problem. Please try again later.'
+  return 'The email provider rejected this message. Please try again later.'
+}
+
+function providerUnreachableReason() {
+  return 'The email provider could not be reached. Please try again later.'
+}
+
+async function failSend(env, sendId, reason) {
+  await env.DB.prepare("UPDATE sends SET status = 'failed', sending_at = NULL, failure_reason = ? WHERE id = ?").bind(reason, sendId).run()
 }
 
 function jsonResponse(data, origin, status = 200) {
@@ -645,6 +661,8 @@ async function routeApi(request, env, ctx, url, session, origin) {
   if (sequenceCloneMatch && method === 'POST') return cloneSequence(env, sequenceCloneMatch[1], session, origin)
   if (path === '/v1/notifications' && method === 'GET') return listNotifications(env, url, session, origin)
   if (path === '/v1/notifications/read' && method === 'POST') return markNotificationsRead(request, env, session, origin)
+  const campaignSendsMatch = path.match(/^\/v1\/campaigns\/([A-Za-z0-9_-]+)\/sends$/)
+  if (campaignSendsMatch && method === 'GET') return campaignSends(env, campaignSendsMatch[1], url, session, origin)
   const statsMatch = path.match(/^\/v1\/stats\/([A-Za-z0-9_-]+)$/)
   if (statsMatch && method === 'GET') return campaignStats(env, statsMatch[1], url, session, origin)
   if (path === '/v1/test/send' && method === 'POST') return sendTest(request, env, session, origin)
@@ -1478,7 +1496,13 @@ async function replyToInbox(request, env, replyId, session, origin) {
   } else {
     providerResult = await sendMicrosoft(sender, credentials, message)
   }
-  if (!providerResult) return errorResponse('Reply could not be sent. Please try again later.', 502, origin)
+  const replySent = providerResult && (providerResult.ok === undefined || providerResult.ok)
+  if (!replySent) {
+    return errorResponse(
+      'Reply could not be sent. Please try again later.', 502, origin,
+      providerResult?.reason ? { reason: providerResult.reason } : undefined,
+    )
+  }
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO inbox_replies (id, reply_id, workspace_id, sender_id, subject, body_text, provider_message_id, sent_at, created_at)
@@ -1859,11 +1883,11 @@ async function exportCampaignStats(env, campaignId, url, session) {
   if (!campaign) return errorResponse('Campaign not found.', 404, APP_ORIGIN)
   const rows = await env.DB.prepare(
     `SELECT l.email, l.first_name, l.company, l.status AS lead_status, s.sequence_step, s.status AS send_status,
-            s.sent_at, s.opened_at, s.clicked_at, s.replied_at
+            s.failure_reason, s.sent_at, s.opened_at, s.clicked_at, s.replied_at
      FROM sends s JOIN leads l ON l.id = s.lead_id
      WHERE s.campaign_id = ? ORDER BY l.email, s.sequence_step`,
   ).bind(campaignId).all()
-  const lines = ['email,first_name,company,lead_status,sequence_step,send_status,sent_at,opened_at,clicked_at,replied_at']
+  const lines = ['email,first_name,company,lead_status,sequence_step,send_status,failure_reason,sent_at,opened_at,clicked_at,replied_at']
   for (const row of rows.results ?? []) {
     const formatTime = (value) => value ? new Date(Number(value)).toISOString() : ''
     lines.push([
@@ -1873,6 +1897,7 @@ async function exportCampaignStats(env, campaignId, url, session) {
       csvEscape(row.lead_status),
       csvEscape(row.sequence_step),
       csvEscape(row.send_status),
+      csvEscape(row.failure_reason ?? ''),
       csvEscape(formatTime(row.sent_at)),
       csvEscape(formatTime(row.opened_at)),
       csvEscape(formatTime(row.clicked_at)),
@@ -2081,7 +2106,7 @@ async function leadTimeline(env, leadId, url, session, origin) {
   ).bind(leadId, session.userId, workspaceId, workspaceId).first()
   if (!lead) return errorResponse('Lead not found.', 404, origin)
   const sends = await env.DB.prepare(
-    `SELECT s.id, s.campaign_id, s.sequence_step, s.status, s.scheduled_at, s.sent_at,
+    `SELECT s.id, s.campaign_id, s.sequence_step, s.status, s.failure_reason, s.scheduled_at, s.sent_at, s.created_at,
             c.name AS campaign_name
      FROM sends s JOIN campaigns c ON c.id = s.campaign_id WHERE s.lead_id = ? ORDER BY s.created_at`,
   ).bind(leadId).all()
@@ -2090,10 +2115,16 @@ async function leadTimeline(env, leadId, url, session, origin) {
      WHERE s.lead_id = ? ORDER BY e.at`,
   ).bind(leadId).all()
   const sendById = new Map((sends.results ?? []).map((send) => [send.id, send]))
-  const timeline = [{ type: 'imported', at: Number(lead.created_at), campaign_name: null, sequence_step: null }]
+  const timeline = [{ type: 'imported', at: Number(lead.created_at), campaign_name: null, sequence_step: null, failure_reason: null }]
   for (const send of sends.results ?? []) {
     if (send.sent_at) {
-      timeline.push({ type: 'sent', at: Number(send.sent_at), campaign_name: send.campaign_name, sequence_step: send.sequence_step })
+      timeline.push({ type: 'sent', at: Number(send.sent_at), campaign_name: send.campaign_name, sequence_step: send.sequence_step, failure_reason: null })
+    }
+    if (send.status === 'failed') {
+      timeline.push({ type: 'failed', at: Number(send.created_at), campaign_name: send.campaign_name, sequence_step: send.sequence_step, failure_reason: send.failure_reason ?? 'The send failed. Please try again later.' })
+    }
+    if (send.status === 'stopped' && send.failure_reason) {
+      timeline.push({ type: 'stopped', at: Number(send.created_at), campaign_name: send.campaign_name, sequence_step: send.sequence_step, failure_reason: send.failure_reason })
     }
   }
   for (const event of events.results ?? []) {
@@ -2103,6 +2134,7 @@ async function leadTimeline(env, leadId, url, session, origin) {
       at: Number(event.at),
       campaign_name: send?.campaign_name ?? null,
       sequence_step: send?.sequence_step ?? null,
+      failure_reason: null,
     })
   }
   timeline.sort((left, right) => left.at - right.at)
@@ -2288,6 +2320,19 @@ async function markNotificationsRead(request, env, session, origin) {
   return jsonResponse({ marked: true }, origin)
 }
 
+async function campaignSends(env, campaignId, url, session, origin) {
+  const workspaceId = url.searchParams.get('workspaceId')
+  const campaign = await ownedCampaign(env, campaignId, session, workspaceId)
+  if (!campaign) return errorResponse('Campaign not found.', 404, origin)
+  const rows = await env.DB.prepare(
+    `SELECT s.id, s.sequence_step, s.status, s.failure_reason, s.scheduled_at, s.sent_at,
+            l.email, l.first_name, l.company
+     FROM sends s JOIN leads l ON l.id = s.lead_id
+     WHERE s.campaign_id = ? ORDER BY l.email, s.sequence_step`,
+  ).bind(campaignId).all()
+  return jsonResponse(rows.results ?? [], origin)
+}
+
 async function campaignStats(env, campaignId, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
   const campaign = await ownedCampaign(env, campaignId, session, workspaceId)
@@ -2297,12 +2342,13 @@ async function campaignStats(env, campaignId, url, session, origin) {
        (SELECT COUNT(*) FROM sends WHERE campaign_id = ? AND sent_at IS NOT NULL) AS sent,
        (SELECT COUNT(*) FROM sends WHERE campaign_id = ? AND status = 'queued') AS queued,
        (SELECT COUNT(*) FROM sends WHERE campaign_id = ? AND status = 'failed') AS failed,
+       (SELECT COUNT(*) FROM sends WHERE campaign_id = ? AND status = 'stopped') AS stopped,
        (SELECT COUNT(DISTINCT e.send_id) FROM events e JOIN sends s ON s.id = e.send_id WHERE s.campaign_id = ? AND e.type = 'delivered') AS delivered,
        (SELECT COUNT(DISTINCT e.send_id) FROM events e JOIN sends s ON s.id = e.send_id WHERE s.campaign_id = ? AND e.type = 'opened') AS opened,
        (SELECT COUNT(DISTINCT e.send_id) FROM events e JOIN sends s ON s.id = e.send_id WHERE s.campaign_id = ? AND e.type = 'clicked') AS clicked,
        (SELECT COUNT(DISTINCT e.send_id) FROM events e JOIN sends s ON s.id = e.send_id WHERE s.campaign_id = ? AND e.type = 'replied') AS replied,
        (SELECT COUNT(DISTINCT e.send_id) FROM events e JOIN sends s ON s.id = e.send_id WHERE s.campaign_id = ? AND e.type = 'bounced') AS bounced`,
-  ).bind(campaignId, campaignId, campaignId, campaignId, campaignId, campaignId, campaignId, campaignId).first()
+  ).bind(campaignId, campaignId, campaignId, campaignId, campaignId, campaignId, campaignId, campaignId, campaignId).first()
   return jsonResponse(result ?? {}, origin)
 }
 
@@ -2390,7 +2436,7 @@ async function sendTest(request, env, session, origin) {
     messageId: null,
     tag: 'kluzar-outreach-test',
   })
-  if (!sent?.messageId) return errorResponse('Test email could not be sent. Please try again later.', 502, origin)
+  if (!sent?.ok) return errorResponse('Test email could not be sent. Please try again later.', 502, origin, { reason: sent?.reason ?? providerUnreachableReason() })
   await env.DB.prepare(
     'INSERT OR IGNORE INTO brevo_ignored_messages (provider_message_id, workspace_id, kind, created_at) VALUES (?, ?, ?, ?)',
   ).bind(sent.messageId, workspace.id, 'test', Date.now()).run()
@@ -2427,7 +2473,7 @@ async function testCampaign(request, env, session, origin) {
     messageId: null,
     tag: 'kluzar-outreach-test',
   })
-  if (!sent?.messageId) return errorResponse('Test campaign could not be sent. Please try again later.', 502, origin)
+  if (!sent?.ok) return errorResponse('Test campaign could not be sent. Please try again later.', 502, origin, { reason: sent?.reason ?? providerUnreachableReason() })
   await env.DB.prepare(
     'INSERT OR IGNORE INTO brevo_ignored_messages (provider_message_id, workspace_id, kind, created_at) VALUES (?, ?, ?, ?)',
   ).bind(sent.messageId, campaign.workspace_id, 'test', Date.now()).run()
@@ -2688,7 +2734,7 @@ function withUnsubscribeFooter(html, token) {
 }
 
 async function sendBrevo(env, message) {
-  if (!env.BREVO_API_KEY) return null
+  if (!env.BREVO_API_KEY) return { ok: false, reason: 'Test sending is not configured yet.' }
   const payload = {
     sender: { name: 'Kluzar', email: 'hello@kluzar.com' },
     to: [{ email: message.email }],
@@ -2704,9 +2750,9 @@ async function sendBrevo(env, message) {
       'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
     }
   }
-  let result
+  let response
   try {
-    const response = await fetch(`${BREVO_API_URL}/smtp/email`, {
+    response = await fetch(`${BREVO_API_URL}/smtp/email`, {
       method: 'POST',
       headers: {
         'api-key': env.BREVO_API_KEY,
@@ -2715,13 +2761,18 @@ async function sendBrevo(env, message) {
       },
       body: JSON.stringify(payload),
     })
-    if (!response.ok) return null
+  } catch {
+    return { ok: false, reason: providerUnreachableReason() }
+  }
+  if (!response.ok) return { ok: false, reason: providerFailureReason(response.status) }
+  let result
+  try {
     result = await response.json()
   } catch {
-    return null
+    return { ok: false, reason: providerFailureReason(0) }
   }
-  if (typeof result.messageId !== 'string' || result.messageId.length < 3) return null
-  return { messageId: result.messageId, threadId: null }
+  if (typeof result.messageId !== 'string' || result.messageId.length < 3) return { ok: false, reason: providerFailureReason(0) }
+  return { ok: true, messageId: result.messageId, threadId: null }
 }
 
 async function sendGmail(env, sender, credentials, message) {
@@ -2766,18 +2817,24 @@ async function sendGmail(env, sender, credentials, message) {
       plainText,
     ].join('\r\n')
   }
+  let response
   try {
-    const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+    response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
       headers: { Authorization: `Bearer ${credentials.accessToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ raw: encodeMimeBody(raw), ...(message.threadId ? { threadId: message.threadId } : {}) }),
     })
-    if (!response.ok) return null
-    const result = await response.json()
-    return { messageId: result.id ?? null, threadId: result.threadId ?? null }
   } catch {
-    return null
+    return { ok: false, reason: providerUnreachableReason() }
   }
+  if (!response.ok) return { ok: false, reason: providerFailureReason(response.status) }
+  let result
+  try {
+    result = await response.json()
+  } catch {
+    return { ok: false, reason: providerFailureReason(0) }
+  }
+  return { ok: true, messageId: result.id ?? null, threadId: result.threadId ?? null }
 }
 
 async function sendMicrosoft(sender, credentials, message) {
@@ -2789,8 +2846,9 @@ async function sendMicrosoft(sender, credentials, message) {
       { name: 'List-Unsubscribe-Post', value: 'List-Unsubscribe=One-Click' },
     )
   }
+  let created
   try {
-    const created = await fetch('https://graph.microsoft.com/v1.0/me/messages', {
+    created = await fetch('https://graph.microsoft.com/v1.0/me/messages', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${credentials.accessToken}`,
@@ -2806,17 +2864,27 @@ async function sendMicrosoft(sender, credentials, message) {
         internetMessageHeaders: headers,
       }),
     })
-    if (!created.ok) return null
-    const draft = await created.json()
-    const sent = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(draft.id)}/send`, {
+  } catch {
+    return { ok: false, reason: providerUnreachableReason() }
+  }
+  if (!created.ok) return { ok: false, reason: providerFailureReason(created.status) }
+  let draft
+  try {
+    draft = await created.json()
+  } catch {
+    return { ok: false, reason: providerFailureReason(0) }
+  }
+  let sent
+  try {
+    sent = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(draft.id)}/send`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${credentials.accessToken}` },
     })
-    if (!sent.ok) return null
-    return { messageId: draft.id, threadId: draft.conversationId ?? null }
   } catch {
-    return null
+    return { ok: false, reason: providerUnreachableReason() }
   }
+  if (!sent.ok) return { ok: false, reason: providerFailureReason(sent.status) }
+  return { ok: true, messageId: draft.id, threadId: draft.conversationId ?? null }
 }
 
 async function sendMicrosoftReply(sender, credentials, message) {
@@ -3031,10 +3099,12 @@ async function unsubscribe(request, env, token) {
 
 async function runScheduler(env) {
   const now = Date.now()
-  await env.DB.prepare(
-    `UPDATE sends SET status = 'failed'
-     WHERE status = 'sending' AND sending_at < ?`,
-  ).bind(now - 1800000).run()
+  const stale = await env.DB.prepare(
+    `SELECT id FROM sends WHERE status = 'sending' AND sending_at < ?`,
+  ).bind(now - 1800000).all()
+  for (const send of stale.results ?? []) {
+    await failSend(env, send.id, 'The send did not complete. Please try again later.')
+  }
   await rampWarmup(env, now)
   await pollReplies(env, now)
   await processNoReplyBranches(env, now)
@@ -3279,7 +3349,7 @@ async function notifyWorkspace(env, workspace, message, emailAllowed = true) {
     messageId: null,
     tag: 'kluzar-outreach-notification',
   })
-  if (sent?.messageId) {
+  if (sent?.ok && sent.messageId) {
     await env.DB.prepare(
       'INSERT OR IGNORE INTO brevo_ignored_messages (provider_message_id, workspace_id, kind, created_at) VALUES (?, ?, ?, ?)',
     ).bind(sent.messageId, workspace.id, 'notification', Date.now()).run()
@@ -3307,13 +3377,16 @@ async function sendDueMessages(env, now) {
       continue
     }
     if (['bounced', 'unsubscribed'].includes(send.lead_status) || (send.lead_status === 'replied' && !send.is_reply_followup)) {
-      await env.DB.prepare("UPDATE sends SET status = 'stopped' WHERE id = ? AND status = 'queued'").bind(send.id).run()
+      await env.DB.prepare("UPDATE sends SET status = 'stopped', failure_reason = ? WHERE id = ? AND status = 'queued'").bind(
+        ['bounced', 'unsubscribed'].includes(send.lead_status) ? 'This address is suppressed and cannot receive mail.' : null,
+        send.id,
+      ).run()
       continue
     }
     const suppression = await env.DB.prepare('SELECT id FROM suppressions WHERE workspace_id = ? AND email = ?')
       .bind(send.workspace_id, send.lead_email).first()
     if (suppression) {
-      await env.DB.prepare("UPDATE sends SET status = 'stopped' WHERE id = ? AND status = 'queued'").bind(send.id).run()
+      await env.DB.prepare("UPDATE sends SET status = 'stopped', failure_reason = ? WHERE id = ? AND status = 'queued'").bind('This address is suppressed and cannot receive mail.', send.id).run()
       continue
     }
     if (await warmupCapReached(env, send.sender_id, now)) continue
@@ -3330,7 +3403,7 @@ async function sendDueMessages(env, now) {
         'INSERT INTO unsubscribe_tokens (token_hash, workspace_id, lead_id, email, expires_at) VALUES (?, ?, ?, ?, ?)',
       ).bind(base64Url(await sha256(unsubscribeToken)), send.workspace_id, send.lead_id, send.lead_email, now + 31536000000).run()
     } catch {
-      await env.DB.prepare("UPDATE sends SET status = 'failed' WHERE id = ?").bind(send.id).run()
+      await failSend(env, send.id, 'The send could not be prepared. Please try again later.')
       continue
     }
     const leadVars = { first_name: send.first_name ?? '', company: send.company ?? '' }
@@ -3352,16 +3425,20 @@ async function sendDueMessages(env, now) {
       credentials_expires_at: send.credentials_expires_at,
     }
     const credentials = await refreshSender(env, sender)
-    const providerResult = !credentials ? null : sender.type === 'gmail_oauth'
+    if (!credentials) {
+      await failSend(env, send.id, 'The mailbox could not be reached. Please reconnect it and try again.')
+      continue
+    }
+    const providerResult = sender.type === 'gmail_oauth'
       ? await sendGmail(env, sender, credentials, message)
       : await sendMicrosoft(sender, credentials, message)
-    if (!providerResult) {
-      await env.DB.prepare("UPDATE sends SET status = 'failed', sending_at = NULL WHERE id = ?").bind(send.id).run()
+    if (!providerResult.ok) {
+      await failSend(env, send.id, providerResult.reason)
       continue
     }
     await env.DB.batch([
       env.DB.prepare(
-        `UPDATE sends SET status = 'sent', sent_at = ?, sending_at = NULL, provider_message_id = ?, provider_thread_id = ?
+        `UPDATE sends SET status = 'sent', sent_at = ?, sending_at = NULL, failure_reason = NULL, provider_message_id = ?, provider_thread_id = ?
          WHERE id = ? AND status = 'sending'`,
       ).bind(Date.now(), providerResult.messageId, providerResult.threadId, send.id),
       env.DB.prepare("UPDATE leads SET status = 'contacted' WHERE id = ? AND status = 'new'").bind(send.lead_id),
@@ -3953,9 +4030,9 @@ async function createInvite(request, env, workspaceId, session, origin) {
     messageId: null,
     tag: 'kluzar-outreach-invite',
   })
-  if (!sent?.messageId) {
+  if (!sent?.ok) {
     await env.DB.prepare('DELETE FROM workspace_invites WHERE id = ?').bind(id).run()
-    return errorResponse('Invite could not be sent. Please try again later.', 502, origin)
+    return errorResponse('Invite could not be sent. Please try again later.', 502, origin, { reason: sent?.reason ?? providerUnreachableReason() })
   }
   await logActivity(env, workspaceId, 'invite_sent', `${email} was invited to the workspace as ${inviteRole}.`)
   return jsonResponse({ id, email, role: inviteRole, expires_at: expiresAt }, origin, 201)
@@ -4379,7 +4456,7 @@ async function executeWorkflowSendEmail(env, send, workspaceId, workflow, action
   const providerResult = sender.type === 'gmail_oauth'
     ? await sendGmail(env, sender, credentials, message)
     : await sendMicrosoft(sender, credentials, message)
-  if (!providerResult) return
+  if (!providerResult.ok) return
   await logActivity(env, workspaceId, 'workflow_email_sent', `Workflow "${workflow.name}" sent "${template.subject}" to ${lead.email}.`)
   const workspace = await env.DB.prepare('SELECT id, owner_email FROM workspaces WHERE id = ?').bind(workspaceId).first()
   if (workspace) await notifyWorkspace(env, workspace, `Workflow "${workflow.name}" sent an email to ${lead.email}.`)
