@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
   lead_list_id TEXT NOT NULL REFERENCES lead_lists(id),
   status TEXT NOT NULL CHECK (status IN ('draft', 'active', 'paused', 'done', 'scheduled', 'archived')),
   scheduled_at INTEGER,
+  workflow_id TEXT REFERENCES workflows(id) ON DELETE SET NULL,
   created_at INTEGER NOT NULL
 );
 

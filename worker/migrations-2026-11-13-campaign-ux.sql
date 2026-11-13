@@ -1,0 +1,1 @@
+ALTER TABLE campaigns ADD COLUMN workflow_id TEXT REFERENCES workflows(id) ON DELETE SET NULL;

@@ -489,6 +489,7 @@ function makeDb(seed = {}) {
     inbox_replies: seed.inbox_replies ?? [],
     unsubscribe_tokens: seed.unsubscribe_tokens ?? [],
     workspace_members: seed.workspace_members ?? [],
+    workflows: seed.workflows ?? [],
   }
   const statements = []
   const findWorkspace = (id, userId) => tables.workspaces.find((row) => row.id === id && row.owner_user_id === userId)
@@ -820,7 +821,7 @@ function makeDb(seed = {}) {
       }
       return { meta: { changes: 1 } }
     }
-    if (sql.includes('SELECT id, name, sender_id, lead_list_id, status, scheduled_at, created_at FROM campaigns c')) {
+    if (sql.includes('SELECT c.id, c.name, c.sender_id, c.lead_list_id, c.status, c.scheduled_at, c.created_at, c.workflow_id, w.name AS workflow_name FROM campaigns c')) {
       const query = String(values[1] ?? '')
       const status = String(values[3] ?? '')
       return {
@@ -828,7 +829,10 @@ function makeDb(seed = {}) {
           row.workspace_id === values[0] &&
           (query === '' || row.name.toLowerCase().includes(query.toLowerCase())) &&
           (status === '' || row.status === status),
-        ),
+        ).map((row) => ({
+          ...row,
+          workflow_name: (tables.workflows ?? []).find((workflow) => workflow.id === row.workflow_id)?.name ?? null,
+        })),
       }
     }
     if (sql.includes('FROM lead_lists l LEFT JOIN lead_list_members')) {
@@ -1569,6 +1573,14 @@ function sqliteEnv(seed = {}) {
       if (!/duplicate column name/i.test(error.message)) throw error
     }
   }
+  const campaignUxMigration = readFileSync(new URL('./migrations-2026-11-13-campaign-ux.sql', import.meta.url), 'utf8')
+  for (const statement of campaignUxMigration.split(/;\s*\n/).map((part) => part.trim()).filter(Boolean)) {
+    try {
+      db.exec(statement)
+    } catch (error) {
+      if (!/duplicate column name/i.test(error.message)) throw error
+    }
+  }
   const accounts = new DatabaseSync(':memory:')
   accounts.exec('CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT NOT NULL, status TEXT NOT NULL, email_verified INTEGER NOT NULL); CREATE TABLE sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL);')
   accounts.prepare('INSERT INTO users (id, email, status, email_verified) VALUES (?, ?, ?, ?)').run('user-1', 'user@example.com', 'active', 1)
@@ -1617,8 +1629,14 @@ function sqSender(db, overrides = {}) {
 }
 
 function sqCampaign(db, overrides = {}) {
-  const row = { id: 'camp-1', workspace_id: 'ws-1', name: 'Launch', sender_id: 'sender-1', lead_list_id: 'list-1', status: 'draft', scheduled_at: null, created_at: 1000, ...overrides }
-  db.prepare('INSERT INTO campaigns (id, workspace_id, name, sender_id, lead_list_id, status, scheduled_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(row.id, row.workspace_id, row.name, row.sender_id, row.lead_list_id, row.status, row.scheduled_at, row.created_at)
+  const row = { id: 'camp-1', workspace_id: 'ws-1', name: 'Launch', sender_id: 'sender-1', lead_list_id: 'list-1', status: 'draft', scheduled_at: null, workflow_id: null, created_at: 1000, ...overrides }
+  db.prepare('INSERT INTO campaigns (id, workspace_id, name, sender_id, lead_list_id, status, scheduled_at, workflow_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(row.id, row.workspace_id, row.name, row.sender_id, row.lead_list_id, row.status, row.scheduled_at, row.workflow_id, row.created_at)
+  return row
+}
+
+function sqWorkflow(db, overrides = {}) {
+  const row = { id: 'wf-1', workspace_id: 'ws-1', name: 'Interested triage', is_active: 1, rules_json: '[]', created_at: 1000, updated_at: 1000, ...overrides }
+  db.prepare('INSERT INTO workflows (id, workspace_id, name, is_active, rules_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(row.id, row.workspace_id, row.name, row.is_active, row.rules_json, row.created_at, row.updated_at)
   return row
 }
 
@@ -1665,6 +1683,8 @@ test('sqlite shim applies schema and feature migration with all new tables and c
   assert.ok(sequenceColumns.includes('template_id'))
   const sendColumns = db.prepare('PRAGMA table_info(sends)').all().map((row) => row.name)
   assert.ok(sendColumns.includes('ab_variant_id'))
+  const campaignColumns = db.prepare('PRAGMA table_info(campaigns)').all().map((row) => row.name)
+  assert.ok(campaignColumns.includes('workflow_id'))
   const warmupColumns = db.prepare('PRAGMA table_info(warmup_state)').all().map((row) => row.name)
   assert.ok(warmupColumns.includes('ramped_on'))
   const filesSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'files'").get().sql
@@ -2301,4 +2321,109 @@ test('launch assigns ab variants deterministically and sends use the variant con
   assert.ok(bMail.includes('B body'))
   assert.ok(bMail.includes('multipart/alternative'))
   assert.ok(bMail.includes('unsubscribe here'))
+})
+
+test('campaign delete removes the campaign and its own rows only', async () => {
+  const { env, db, accounts } = sqliteEnv()
+  sqWorkspace(db)
+  sqList(db)
+  sqSender(db)
+  sqCampaign(db, { status: 'active' })
+  sqSequence(db)
+  sqLead(db)
+  addListMember(db, 'list-1', 'lead-1')
+  sqSend(db, { id: 'send-1', status: 'sent', sent_at: 1000 })
+  db.prepare("INSERT INTO events (id, send_id, type, at) VALUES ('ev-1', 'send-1', 'delivered', 2000)").run()
+  db.prepare("INSERT INTO replies (id, send_id, sender_email, subject, body_text, received_at) VALUES ('rep-1', 'send-1', 'ada@example.com', 'Re: Hello', 'Hi', 3000)").run()
+  sqCampaign(db, { id: 'camp-2', name: 'Keep me', status: 'draft' })
+  addAccountUser(accounts, 'user-2', 'other@example.com')
+  const forbidden = await worker.fetch(authedRequestFor('user-2', 'DELETE', '/v1/campaigns/camp-1'), env, { waitUntil() {} })
+  assert.equal(forbidden.status, 404)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE id = 'camp-1'").get().n, 1)
+  const deleted = await worker.fetch(authedRequest('DELETE', '/v1/campaigns/camp-1'), env, { waitUntil() {} })
+  assert.equal(deleted.status, 200)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE id = 'camp-1'").get().n, 0)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sequences WHERE campaign_id = 'camp-1'").get().n, 0)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sends WHERE campaign_id = 'camp-1'").get().n, 0)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE send_id = 'send-1'").get().n, 0)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM replies WHERE send_id = 'send-1'").get().n, 0)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE id = 'camp-2'").get().n, 1)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM leads WHERE id = 'lead-1'").get().n, 1)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM lead_lists WHERE id = 'list-1'").get().n, 1)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM senders WHERE id = 'sender-1'").get().n, 1)
+  const gone = await worker.fetch(authedRequest('GET', '/v1/campaigns/camp-1?workspaceId=ws-1'), env, { waitUntil() {} })
+  assert.equal(gone.status, 404)
+  const missing = await worker.fetch(authedRequest('DELETE', '/v1/campaigns/nope'), env, { waitUntil() {} })
+  assert.equal(missing.status, 404)
+})
+
+test('paused campaign re-launches and queues only remaining unsent leads', async () => {
+  const { env, db } = sqliteEnv()
+  sqWorkspace(db)
+  sqList(db)
+  sqSender(db)
+  sqCampaign(db, { status: 'paused' })
+  sqSequence(db)
+  sqLead(db)
+  sqLead(db, { id: 'lead-2', email: 'bo@example.com', first_name: 'Bo', company: 'Beta' })
+  addListMember(db, 'list-1', 'lead-1')
+  addListMember(db, 'list-1', 'lead-2')
+  sqSend(db, { id: 'send-1', lead_id: 'lead-1', status: 'sent', sent_at: 1000 })
+  const relaunched = await worker.fetch(authedRequest('POST', '/v1/campaigns/camp-1/launch', { confirmAuthorizedRecipients: true }), env, { waitUntil() {} })
+  assert.equal(relaunched.status, 200)
+  const data = (await relaunched.json()).data
+  assert.equal(data.status, 'active')
+  assert.equal(data.queued, 1)
+  assert.equal(db.prepare("SELECT status FROM campaigns WHERE id = 'camp-1'").get().status, 'active')
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sends WHERE campaign_id = 'camp-1' AND lead_id = 'lead-2' AND status = 'queued'").get().n, 1)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sends WHERE campaign_id = 'camp-1' AND lead_id = 'lead-1'").get().n, 1)
+  const activeAgain = await worker.fetch(authedRequest('POST', '/v1/campaigns/camp-1/launch', { confirmAuthorizedRecipients: true }), env, { waitUntil() {} })
+  assert.equal(activeAgain.status, 409)
+})
+
+test('campaign workflow can be set, cleared, and is used for evaluation; other-workspace workflows are rejected', async () => {
+  const { env, db } = sqliteEnv()
+  sqWorkspace(db)
+  sqWorkspace(db, { id: 'ws-2', owner_user_id: 'user-1', owner_email: 'user@example.com', name: 'Second' })
+  sqList(db)
+  sqList(db, { id: 'list-2', workspace_id: 'ws-1', name: 'Interested' })
+  sqSender(db)
+  sqCampaign(db, { status: 'active' })
+  sqSequence(db)
+  sqLead(db)
+  sqSend(db, { id: 'send-1', status: 'sent', sent_at: Date.now() - 3600000, created_at: Date.now() - 3600000 })
+  sqWorkflow(db, { id: 'wf-own', name: 'Own algorithm', rules_json: JSON.stringify([{ id: 'r1', condition: { type: 'reply_contains', value: 'interested' }, actions: [{ type: 'move_to_list', listId: 'list-2' }] }]) })
+  sqWorkflow(db, { id: 'wf-other', workspace_id: 'ws-2', name: 'Other workspace algorithm', rules_json: '[]' })
+  const rejected = await worker.fetch(authedRequest('POST', '/v1/campaigns/camp-1/workflow', { workflowId: 'wf-other' }), env, { waitUntil() {} })
+  assert.equal(rejected.status, 400)
+  assert.equal(db.prepare("SELECT workflow_id FROM campaigns WHERE id = 'camp-1'").get().workflow_id, null)
+  const missing = await worker.fetch(authedRequest('POST', '/v1/campaigns/camp-1/workflow', { workflowId: 'nope' }), env, { waitUntil() {} })
+  assert.equal(missing.status, 400)
+  const set = await worker.fetch(authedRequest('POST', '/v1/campaigns/camp-1/workflow', { workflowId: 'wf-own' }), env, { waitUntil() {} })
+  assert.equal(set.status, 200)
+  assert.equal((await set.json()).data.workflow_id, 'wf-own')
+  assert.equal(db.prepare("SELECT workflow_id FROM campaigns WHERE id = 'camp-1'").get().workflow_id, 'wf-own')
+  const listed = await worker.fetch(authedRequest('GET', '/v1/campaigns?workspaceId=ws-1'), env, { waitUntil() {} })
+  assert.equal((await listed.json()).data[0].workflow_name, 'Own algorithm')
+  const send = db.prepare('SELECT * FROM sends WHERE id = ?').get('send-1')
+  await recordReply(env, { ...send, workspace_id: 'ws-1', sender_type: 'gmail_oauth' }, { senderEmail: 'ada@example.com', subject: 'Re: Hello', bodyText: 'Yes, I am INTERESTED!', receivedAt: Date.now() })
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM lead_list_members WHERE list_id = 'list-2' AND lead_id = 'lead-1'").get().n, 1)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM workflow_executions WHERE workflow_id = 'wf-own'").get().n, 1)
+  sqWorkflow(db, { id: 'wf-second', name: 'Second algorithm', rules_json: JSON.stringify([{ id: 'r1', condition: { type: 'reply_any' }, actions: [{ type: 'change_status', status: 'not_interested' }] }]) })
+  sqSend(db, { id: 'send-2', sequence_step: 2, status: 'sent', sent_at: Date.now() - 1800000, created_at: Date.now() - 1800000 })
+  await worker.fetch(authedRequest('POST', '/v1/campaigns/camp-1/workflow', { workflowId: 'wf-second' }), env, { waitUntil() {} })
+  const send2 = db.prepare('SELECT * FROM sends WHERE id = ?').get('send-2')
+  await recordReply(env, { ...send2, workspace_id: 'ws-1', sender_type: 'gmail_oauth' }, { senderEmail: 'ada@example.com', subject: 'Re: Hello', bodyText: 'Anything at all', receivedAt: Date.now() })
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM workflow_executions WHERE workflow_id = 'wf-own'").get().n, 1)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM workflow_executions WHERE workflow_id = 'wf-second'").get().n, 1)
+  assert.equal(db.prepare("SELECT status FROM leads WHERE id = 'lead-1'").get().status, 'not_interested')
+  const cleared = await worker.fetch(authedRequest('POST', '/v1/campaigns/camp-1/workflow', { workflowId: null }), env, { waitUntil() {} })
+  assert.equal(cleared.status, 200)
+  assert.equal((await cleared.json()).data.workflow_id, null)
+  assert.equal(db.prepare("SELECT workflow_id FROM campaigns WHERE id = 'camp-1'").get().workflow_id, null)
+  const created = await worker.fetch(authedRequest('POST', '/v1/campaigns', { workspaceId: 'ws-1', leadListId: 'list-1', name: 'With algorithm', workflowId: 'wf-own' }), env, { waitUntil() {} })
+  assert.equal(created.status, 201)
+  assert.equal((await created.json()).data.workflow_id, 'wf-own')
+  const badCreate = await worker.fetch(authedRequest('POST', '/v1/campaigns', { workspaceId: 'ws-1', leadListId: 'list-1', name: 'Bad algorithm', workflowId: 'wf-other' }), env, { waitUntil() {} })
+  assert.equal(badCreate.status, 400)
 })

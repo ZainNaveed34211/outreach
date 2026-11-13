@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { clearAssertion, fetchAccountSession, getAssertion } from './lib/account'
 import { AnalyticsOverview, AbTestingPage, DashboardSidebar, DeliverabilityWarmupPage, DnsPage, IntegrationsPage, TeamPage, TemplatePicker, TemplatesPage, WorkflowsPage } from './dashboard'
-import type { AnalyticsOverviewData, EmailTemplate, EmailTemplateDraft, TeamInvite, TeamMember, WarmupState } from './dashboard'
+import type { AnalyticsOverviewData, EmailTemplate, EmailTemplateDraft, TeamInvite, TeamMember, WarmupState, Workflow } from './dashboard'
 import { dashboardRequest, fetchAnalyticsOverview, fetchJson } from './dashboard/api'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'https://outreach-api.kluzar.com/v1'
@@ -12,7 +12,7 @@ const SUPPORT_URL = 'https://support.kluzar.com'
 
 type Workspace = { id: string; name: string }
 type ApiResult<T> = { data?: T; error?: string; csrfToken?: string }
-type Campaign = { id: string; name: string; status: string; lead_list_id: string; sender_id?: string | null; scheduled_at?: number | null }
+type Campaign = { id: string; name: string; status: string; lead_list_id: string; sender_id?: string | null; scheduled_at?: number | null; workflow_id?: string | null; workflow_name?: string | null }
 type Lead = { id: string; email: string; first_name?: string; company?: string; status: string }
 type LeadList = { id: string; name: string; lead_count: number }
 type Sender = { id: string; type: string; address: string; display_name: string; is_default: number; created_at: number }
@@ -793,6 +793,9 @@ function DashboardPage({ path }: { path: string }) {
   const [inviteResult, setInviteResult] = useState('')
   const [campaignTemplateId, setCampaignTemplateId] = useState<string | null>(null)
   const [campaignBodyHtml, setCampaignBodyHtml] = useState<string | null>(null)
+  const [workflows, setWorkflows] = useState<Workflow[]>([])
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState('')
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null)
   const [suppEmail, setSuppEmail] = useState('')
   const [suppReason, setSuppReason] = useState('unsubscribed')
   const [preferences, setPreferences] = useState<{ notifyReplyEmail: boolean } | null>(null)
@@ -832,6 +835,15 @@ function DashboardPage({ path }: { path: string }) {
     } catch {
       setTemplates([])
       setTemplatesUnavailable(true)
+    }
+  }
+
+  const loadWorkflows = async () => {
+    try {
+      const rows = await fetchJson<Workflow[]>(`/workflows?workspaceId=${encodeURIComponent(workspaceId)}`, csrfToken)
+      setWorkflows(rows)
+    } catch {
+      setWorkflows([])
     }
   }
 
@@ -979,6 +991,11 @@ function DashboardPage({ path }: { path: string }) {
   useEffect(() => {
     if (!['templates', 'campaigns', 'workflows', 'ab-testing'].includes(section) || !workspaceId) return
     loadTemplates()
+  }, [section, workspaceId, csrfToken])
+
+  useEffect(() => {
+    if (section !== 'campaigns' || !workspaceId) return
+    loadWorkflows()
   }, [section, workspaceId, csrfToken])
 
   useEffect(() => {
@@ -1293,7 +1310,7 @@ function DashboardPage({ path }: { path: string }) {
     try {
       const campaign = await request<Campaign>('/campaigns', {
         method: 'POST',
-        body: JSON.stringify({ workspaceId, leadListId: selectedListId, senderId: selectedSenderId || null, name: campaignName.trim() }),
+        body: JSON.stringify({ workspaceId, leadListId: selectedListId, senderId: selectedSenderId || null, name: campaignName.trim(), workflowId: selectedWorkflowId || null }),
       })
       await request('/sequences', {
         method: 'POST',
@@ -1312,6 +1329,7 @@ function DashboardPage({ path }: { path: string }) {
       setFollowupBody('')
       setCampaignTemplateId(null)
       setCampaignBodyHtml(null)
+      setSelectedWorkflowId('')
       setSenderNoneChosen(false)
       setShowCampaignForm(false)
       setNotice('Campaign draft created. Test it before launch.')
@@ -1538,6 +1556,36 @@ function DashboardPage({ path }: { path: string }) {
       await refreshRecords()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Campaign could not be restored.')
+    }
+  }
+
+  const deleteCampaign = async (campaignId: string) => {
+    if (deleteConfirmId !== campaignId) {
+      setDeleteConfirmId(campaignId)
+      return
+    }
+    setDeleteConfirmId(null)
+    setError('')
+    try {
+      await request(`/campaigns/${encodeURIComponent(campaignId)}`, { method: 'DELETE' })
+      setNotice('Campaign deleted.')
+      await refreshRecords()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Campaign could not be deleted.')
+    }
+  }
+
+  const setCampaignWorkflow = async (campaignId: string, workflowId: string | null) => {
+    setError('')
+    try {
+      await request(`/campaigns/${encodeURIComponent(campaignId)}/workflow`, {
+        method: 'POST',
+        body: JSON.stringify({ workflowId }),
+      })
+      setNotice(workflowId ? 'Algorithm updated for this campaign.' : 'Algorithm removed from this campaign.')
+      await refreshRecords()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Algorithm could not be updated.')
     }
   }
 
@@ -1809,7 +1857,7 @@ function DashboardPage({ path }: { path: string }) {
             <div className="dashboard-loading" aria-live="polite"><span className="loading-spinner" /><p>Loading your overview…</p></div>
           )}
           {workspaces.length > 0 && section === 'campaigns' && <>
-            {showCampaignForm && <section className="table-panel form-panel"><div className="table-panel-header"><div><h2>New campaign</h2><p>Create a draft now. A reply-monitored mailbox can be connected later and is required only before launch.</p></div></div>{!lists.length ? <p className="muted-copy">Create a lead list first — a campaign needs an audience before anything else.</p> : <form onSubmit={createCampaign}><label htmlFor="campaign-name">Campaign name</label><input id="campaign-name" value={campaignName} onChange={(event) => setCampaignName(event.target.value)} maxLength={120} required /><label htmlFor="campaign-list">Lead list</label><select id="campaign-list" value={selectedListId} onChange={(event) => setSelectedListId(event.target.value)} required>{lists.map((list) => <option value={list.id} key={list.id}>{list.name} ({list.lead_count})</option>)}</select><label htmlFor="campaign-sender">Reply-monitored sender</label><select id="campaign-sender" value={selectedSenderId} onChange={(event) => { setSelectedSenderId(event.target.value); setSenderNoneChosen(event.target.value === '') }}><option value="">No sender yet — connect later</option>{senders.filter((sender) => sender.type === 'gmail_oauth' || sender.type === 'outlook_oauth').map((sender) => <option value={sender.id} key={sender.id}>{sender.address}</option>)}</select><p className="form-hint">You can connect Gmail or Microsoft later — a reply-monitored mailbox is required only before launch.</p><label htmlFor="campaign-subject">First email subject</label><input id="campaign-subject" value={campaignSubject} onChange={(event) => setCampaignSubject(event.target.value)} maxLength={200} required /><TemplatePicker templates={templates} value={campaignTemplateId} onSelect={(template) => { setCampaignSubject((current) => current || template.subject); setCampaignBody(template.text); setCampaignTemplateId(template.id); setCampaignBodyHtml(template.html) }} /><label htmlFor="campaign-body">First email</label><textarea id="campaign-body" value={campaignBody} onChange={(event) => setCampaignBody(event.target.value)} maxLength={10000} required /><p className="form-hint">Available variables: {'{{first_name}}'}, {'{{company}}'}. Messages are sent as plain text.</p><label htmlFor="followup-subject">Optional follow-up subject</label><input id="followup-subject" value={followupSubject} onChange={(event) => setFollowupSubject(event.target.value)} maxLength={200} /><label htmlFor="followup-days">Follow-up delay in days</label><input id="followup-days" type="number" min="1" max="365" value={followupDelay} onChange={(event) => setFollowupDelay(event.target.value)} /><label htmlFor="followup-body">Optional follow-up message</label><textarea id="followup-body" value={followupBody} onChange={(event) => setFollowupBody(event.target.value)} maxLength={10000} /><button className="button button-primary" disabled={formBusy}>{formBusy ? 'Saving…' : 'Create draft'}</button></form>}</section>}
+            {showCampaignForm && <section className="table-panel form-panel"><div className="table-panel-header"><div><h2>New campaign</h2><p>Create a draft now. A reply-monitored mailbox can be connected later and is required only before launch.</p></div></div>{!lists.length ? <p className="muted-copy">Create a lead list first — a campaign needs an audience before anything else.</p> : <form onSubmit={createCampaign}><label htmlFor="campaign-name">Campaign name</label><input id="campaign-name" value={campaignName} onChange={(event) => setCampaignName(event.target.value)} maxLength={120} required /><label htmlFor="campaign-list">Lead list</label><select id="campaign-list" value={selectedListId} onChange={(event) => setSelectedListId(event.target.value)} required>{lists.map((list) => <option value={list.id} key={list.id}>{list.name} ({list.lead_count})</option>)}</select><label htmlFor="campaign-sender">Reply-monitored sender</label><select id="campaign-sender" value={selectedSenderId} onChange={(event) => { setSelectedSenderId(event.target.value); setSenderNoneChosen(event.target.value === '') }}><option value="">No sender yet — connect later</option>{senders.filter((sender) => sender.type === 'gmail_oauth' || sender.type === 'outlook_oauth').map((sender) => <option value={sender.id} key={sender.id}>{sender.address}</option>)}</select><p className="form-hint">You can connect Gmail or Microsoft later — a reply-monitored mailbox is required only before launch.</p><label htmlFor="campaign-workflow">Algorithm (workflow)</label><select id="campaign-workflow" value={selectedWorkflowId} onChange={(event) => setSelectedWorkflowId(event.target.value)}><option value="">No algorithm</option>{workflows.map((workflow) => <option value={workflow.id} key={workflow.id}>{workflow.name}</option>)}</select><p className="form-hint">Choose a workflow to run automatically for this campaign. Leave it empty to use the workspace workflows.</p><label htmlFor="campaign-subject">First email subject</label><input id="campaign-subject" value={campaignSubject} onChange={(event) => setCampaignSubject(event.target.value)} maxLength={200} required /><TemplatePicker templates={templates} value={campaignTemplateId} onSelect={(template) => { setCampaignSubject((current) => current || template.subject); setCampaignBody(template.text); setCampaignTemplateId(template.id); setCampaignBodyHtml(template.html) }} /><label htmlFor="campaign-body">First email</label><textarea id="campaign-body" value={campaignBody} onChange={(event) => setCampaignBody(event.target.value)} maxLength={10000} required /><p className="form-hint">Available variables: {'{{first_name}}'}, {'{{company}}'}. Messages are sent as plain text.</p><label htmlFor="followup-subject">Optional follow-up subject</label><input id="followup-subject" value={followupSubject} onChange={(event) => setFollowupSubject(event.target.value)} maxLength={200} /><label htmlFor="followup-days">Follow-up delay in days</label><input id="followup-days" type="number" min="1" max="365" value={followupDelay} onChange={(event) => setFollowupDelay(event.target.value)} /><label htmlFor="followup-body">Optional follow-up message</label><textarea id="followup-body" value={followupBody} onChange={(event) => setFollowupBody(event.target.value)} maxLength={10000} /><button className="button button-primary" disabled={formBusy}>{formBusy ? 'Saving…' : 'Create draft'}</button></form>}</section>}
             <section className="table-panel"><div className="table-panel-header"><div><h2>Campaigns</h2><p>Production launch requires a reply-monitored mailbox. Sending is limited to 50 messages per workspace per day, with at least 60 seconds between sends.</p></div></div>
               <div className="filter-bar"><input aria-label="Search campaigns" type="search" placeholder="Search campaigns…" value={campaignQuery} onChange={(event) => setCampaignQuery(event.target.value)} /><select aria-label="Filter by status" value={campaignStatus} onChange={(event) => setCampaignStatus(event.target.value)}><option value="">All statuses</option><option value="draft">Draft</option><option value="scheduled">Scheduled</option><option value="active">Active</option><option value="paused">Paused</option><option value="done">Done</option><option value="archived">Archived</option></select><select aria-label="Sort campaigns" value={campaignSort} onChange={(event) => setCampaignSort(event.target.value)}><option value="created_desc">Newest first</option><option value="created_asc">Oldest first</option><option value="name_asc">Name A–Z</option><option value="name_desc">Name Z–A</option></select></div>
               {preview && <div className="preview-panel"><div className="table-panel-header"><div><h2>Preview — {preview.campaign.name}</h2><p>Exactly what the lead will receive, with their details filled in.</p></div><button className="text-button" onClick={() => setPreview(null)}>Close preview</button></div>{previewLeads.length > 0 && <label className="preview-lead-select">Preview as<select value={previewLeadId} onChange={(event) => changePreviewLead(preview.campaign.id, event.target.value)}>{previewLeads.map((lead) => <option value={lead.id} key={lead.id}>{lead.email}{lead.first_name ? ` — ${lead.first_name}` : ''}</option>)}</select></label>}{preview.lead && <p className="muted-copy">Previewing with {preview.lead.email}{preview.lead.first_name ? ` (${preview.lead.first_name}${preview.lead.company ? `, ${preview.lead.company}` : ''})` : ''}.</p>}{preview.steps.length ? preview.steps.map((step) => <article className="preview-step" key={step.step_no}><span>Step {step.step_no}{step.delay_days > 0 ? ` · sent ${step.delay_days} days after the previous step` : ' · sent first'}</span><h3>{step.subject}</h3><pre>{step.body}</pre>{step.html && <div className="preview-html"><p className="form-hint">Designed version — how the email looks with its design applied.</p><iframe title={`Designed preview for step ${step.step_no}`} srcDoc={step.html} sandbox="" className="preview-html-frame" /></div>}</article>) : <div className="compact-empty">This campaign has no message steps yet.</div>}</div>}
@@ -1824,7 +1872,7 @@ function DashboardPage({ path }: { path: string }) {
               </ul>
               {prelaunch.campaign.status === 'draft' && <form className="schedule-form" onSubmit={(event) => { event.preventDefault(); void scheduleCampaign(prelaunch.campaign.id) }}><label htmlFor="schedule-at">Schedule launch for</label><input id="schedule-at" type="datetime-local" value={scheduleValue} onChange={(event) => setScheduleValue(event.target.value)} required /><button className="button button-outline button-small" disabled={formBusy}>Schedule launch</button></form>}
               <p className="form-hint">Scheduled launches are picked up by the Worker within a minute of the chosen time. Launching still asks you to confirm you have permission to contact the list.</p></div>}
-              {records.filter((record): record is Campaign => 'name' in record && 'status' in record && 'lead_list_id' in record).length ? <div className="campaign-list">{records.filter((record): record is Campaign => 'name' in record && 'status' in record && 'lead_list_id' in record).map((campaign) => <article className="campaign-row" key={campaign.id}><div><strong>{campaign.name}</strong><span>{campaign.status}{campaign.scheduled_at ? ` · scheduled ${new Date(campaign.scheduled_at).toLocaleString()}` : ''} · {lists.find((list) => list.id === campaign.lead_list_id)?.name ?? 'Lead list'}</span>{stats[campaign.id] && <small>{Object.entries(stats[campaign.id]).map(([key, value]) => `${key}: ${value}`).join(' · ') || 'No events recorded'}</small>}</div><div className="row-actions"><button className="text-button" onClick={() => showCampaignStats(campaign.id)}>View stats</button><button className="text-button" onClick={() => openPreview(campaign)}>Preview</button><button className="text-button" onClick={() => openPrelaunch(campaign)}>Check before launch</button><button className="text-button" onClick={() => cloneCampaign(campaign.id)}>Duplicate</button><button className="text-button" onClick={() => exportCampaignStatsCsv(campaign)}>Export stats</button>{campaign.status === 'archived' ? <button className="text-button" onClick={() => unarchiveCampaign(campaign.id)}>Restore</button> : <button className="text-button" onClick={() => archiveCampaign(campaign.id)}>Archive</button>}{campaign.status === 'scheduled' && <button className="text-button" onClick={() => cancelSchedule(campaign)}>Cancel schedule</button>}{campaign.status === 'draft' && <><label className="launch-confirm"><input type="checkbox" checked={launchConfirmation === campaign.id} onChange={(event) => setLaunchConfirmation(event.target.checked ? campaign.id : '')} /> I have permission to contact this list</label><button className="button button-primary button-small" disabled={formBusy || launchConfirmation !== campaign.id} onClick={() => launchCampaign(campaign.id)}>Launch</button></>}</div></article>)}</div> : <div className="table-empty"><span className="empty-icon">↗</span><h3>No campaigns yet</h3><p>Create a draft after connecting a mailbox and adding a lead list. A campaign needs a lead list, a reply-monitored sender, and a first message — then test it to your own email before launch.</p><p className="muted-copy">Drafts are free to create and change. Launching queues recipients for paced sending, with suppression checked before every send.</p></div>}</section>
+              {records.filter((record): record is Campaign => 'name' in record && 'status' in record && 'lead_list_id' in record).length ? <div className="campaign-list">{records.filter((record): record is Campaign => 'name' in record && 'status' in record && 'lead_list_id' in record).map((campaign) => <article className="campaign-row" key={campaign.id}><div><strong>{campaign.name}</strong><span>{campaign.status}{campaign.scheduled_at ? ` · scheduled ${new Date(campaign.scheduled_at).toLocaleString()}` : ''} · {lists.find((list) => list.id === campaign.lead_list_id)?.name ?? 'Lead list'}</span><span>Algorithm: {campaign.workflow_name ?? 'No algorithm'}</span>{stats[campaign.id] && <small>{Object.entries(stats[campaign.id]).map(([key, value]) => `${key}: ${value}`).join(' · ') || 'No events recorded'}</small>}</div><div className="row-actions"><button className="text-button" onClick={() => showCampaignStats(campaign.id)}>View stats</button><button className="text-button" onClick={() => openPreview(campaign)}>Preview</button><button className="text-button" onClick={() => openPrelaunch(campaign)}>Check before launch</button><button className="text-button" onClick={() => cloneCampaign(campaign.id)}>Duplicate</button><button className="text-button" onClick={() => exportCampaignStatsCsv(campaign)}>Export stats</button>{campaign.status === 'archived' ? <button className="text-button" onClick={() => unarchiveCampaign(campaign.id)}>Restore</button> : <button className="text-button" onClick={() => archiveCampaign(campaign.id)}>Archive</button>}<button className="text-button" onClick={() => deleteCampaign(campaign.id)}>{deleteConfirmId === campaign.id ? 'Confirm delete?' : 'Delete'}</button><label className="launch-confirm">Algorithm <select aria-label={`Algorithm for ${campaign.name}`} value={campaign.workflow_id ?? ''} disabled={formBusy} onChange={(event) => setCampaignWorkflow(campaign.id, event.target.value || null)}><option value="">No algorithm</option>{workflows.map((workflow) => <option value={workflow.id} key={workflow.id}>{workflow.name}</option>)}</select></label>{campaign.status === 'scheduled' && <button className="text-button" onClick={() => cancelSchedule(campaign)}>Cancel schedule</button>}{(campaign.status === 'draft' || campaign.status === 'paused' || campaign.status === 'done') && <><label className="launch-confirm"><input type="checkbox" checked={launchConfirmation === campaign.id} onChange={(event) => setLaunchConfirmation(event.target.checked ? campaign.id : '')} /> I have permission to contact this list</label><button className="button button-primary button-small" disabled={formBusy || launchConfirmation !== campaign.id} onClick={() => launchCampaign(campaign.id)}>{campaign.status === 'draft' ? 'Launch' : 'Re-launch'}</button></>}</div></article>)}</div> : <div className="table-empty"><span className="empty-icon">↗</span><h3>No campaigns yet</h3><p>Create a draft after connecting a mailbox and adding a lead list. A campaign needs a lead list, a reply-monitored sender, and a first message — then test it to your own email before launch.</p><p className="muted-copy">Drafts are free to create and change. Launching queues recipients for paced sending, with suppression checked before every send.</p></div>}</section>
           </>}
           {workspaces.length > 0 && section === 'leads' && <>
             <section className="table-panel"><div className="table-panel-header"><div><h2>Lead lists</h2><p>Organise contacts you are authorised to contact. Only import lists you have permission to use — purchased or scraped lists do not belong here.</p></div><div className="row-actions"><button className="button button-outline button-small" onClick={() => setShowListForm((value) => !value)}>New list</button><button className="button button-primary button-small" onClick={() => setShowLeadForm((value) => !value)}>Add lead</button></div></div>

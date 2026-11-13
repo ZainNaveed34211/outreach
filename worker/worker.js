@@ -574,6 +574,7 @@ async function routeApi(request, env, ctx, url, session, origin) {
   const campaignMatch = path.match(/^\/v1\/campaigns\/([A-Za-z0-9_-]+)$/)
   if (campaignMatch && method === 'GET') return getCampaign(env, campaignMatch[1], url, session, origin)
   if (campaignMatch && method === 'PATCH') return updateCampaign(request, env, campaignMatch[1], session, origin)
+  if (campaignMatch && method === 'DELETE') return deleteCampaign(env, campaignMatch[1], session, origin)
   const campaignAction = path.match(/^\/v1\/campaigns\/([A-Za-z0-9_-]+)\/(launch|pause)$/)
   if (campaignAction && method === 'POST') return campaignActionResponse(request, env, campaignAction[1], campaignAction[2], session, origin)
   if (path === '/v1/leads' && method === 'GET') return listLeads(env, url, session, origin)
@@ -632,6 +633,8 @@ async function routeApi(request, env, ctx, url, session, origin) {
   if (campaignUnarchiveMatch && method === 'POST') return unarchiveCampaign(env, campaignUnarchiveMatch[1], session, origin)
   const campaignStatsCsvMatch = path.match(/^\/v1\/campaigns\/([A-Za-z0-9_-]+)\/stats.csv$/)
   if (campaignStatsCsvMatch && method === 'GET') return exportCampaignStats(env, campaignStatsCsvMatch[1], url, session)
+  const campaignWorkflowMatch = path.match(/^\/v1\/campaigns\/([A-Za-z0-9_-]+)\/workflow$/)
+  if (campaignWorkflowMatch && method === 'POST') return setCampaignWorkflow(request, env, campaignWorkflowMatch[1], session, origin)
   const sequenceCloneMatch = path.match(/^\/v1\/sequences\/([A-Za-z0-9_-]+)\/clone$/)
   if (sequenceCloneMatch && method === 'POST') return cloneSequence(env, sequenceCloneMatch[1], session, origin)
   if (path === '/v1/notifications' && method === 'GET') return listNotifications(env, url, session, origin)
@@ -755,8 +758,9 @@ async function listCampaigns(env, url, session, origin) {
         ? 'c.name DESC'
         : 'c.created_at DESC'
   const rows = await env.DB.prepare(
-    `SELECT id, name, sender_id, lead_list_id, status, scheduled_at, created_at FROM campaigns c
-     WHERE workspace_id = ?
+    `SELECT c.id, c.name, c.sender_id, c.lead_list_id, c.status, c.scheduled_at, c.created_at, c.workflow_id, w.name AS workflow_name FROM campaigns c
+     LEFT JOIN workflows w ON w.id = c.workflow_id
+     WHERE c.workspace_id = ?
        AND (? = '' OR c.name LIKE ? ESCAPE '\\')
        AND (? = '' OR c.status = ?)
      ORDER BY ${orderBy}`,
@@ -779,19 +783,26 @@ async function createCampaign(request, env, session, origin) {
     ).bind(body.senderId, body.workspaceId).first()
     if (!sender) return errorResponse('Sender not found.', 404, origin)
   }
+  const workflowId = typeof body.workflowId === 'string' && body.workflowId.trim() ? body.workflowId.trim() : null
+  if (workflowId) {
+    const workflow = await env.DB.prepare(
+      'SELECT id FROM workflows WHERE id = ? AND workspace_id = ?',
+    ).bind(workflowId, body.workspaceId).first()
+    if (!workflow) return errorResponse('Workflow not found in this workspace.', 400, origin)
+  }
   const id = crypto.randomUUID()
   const createdAt = Date.now()
   await env.DB.prepare(
-    'INSERT INTO campaigns (id, workspace_id, name, sender_id, lead_list_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-  ).bind(id, body.workspaceId, body.name.trim(), body.senderId ?? null, body.leadListId, 'draft', createdAt).run()
+    'INSERT INTO campaigns (id, workspace_id, name, sender_id, lead_list_id, status, workflow_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  ).bind(id, body.workspaceId, body.name.trim(), body.senderId ?? null, body.leadListId, 'draft', workflowId, createdAt).run()
   await logActivity(env, body.workspaceId, 'campaign_created', `Campaign "${body.name.trim()}" was created as a draft.`)
-  return jsonResponse({ id, name: body.name.trim(), sender_id: body.senderId ?? null, lead_list_id: body.leadListId, status: 'draft', created_at: createdAt }, origin, 201)
+  return jsonResponse({ id, name: body.name.trim(), sender_id: body.senderId ?? null, lead_list_id: body.leadListId, status: 'draft', workflow_id: workflowId, created_at: createdAt }, origin, 201)
 }
 
 async function getCampaign(env, campaignId, url, session, origin) {
   const workspaceId = url.searchParams.get('workspaceId')
   const campaign = await env.DB.prepare(
-    `SELECT c.id, c.workspace_id, c.name, c.sender_id, c.lead_list_id, c.status, c.scheduled_at, c.created_at
+    `SELECT c.id, c.workspace_id, c.name, c.sender_id, c.lead_list_id, c.status, c.scheduled_at, c.workflow_id, c.created_at
      FROM campaigns c JOIN workspaces w ON w.id = c.workspace_id
      WHERE c.id = ? AND (? IS NULL OR c.workspace_id = ?) AND (w.owner_user_id = ? OR EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = w.id AND user_id = ?))`,
   ).bind(campaignId, workspaceId, workspaceId, session.userId, session.userId).first()
@@ -829,7 +840,7 @@ async function campaignActionResponse(request, env, campaignId, action, session,
     await logActivity(env, campaign.workspace_id, 'campaign_paused', `Campaign "${campaign.name ?? 'Untitled'}" was paused.`)
     return jsonResponse({ id: campaignId, status: 'paused' }, origin)
   }
-  if (campaign.status !== 'draft') return errorResponse('Only a draft campaign can be launched.', 409, origin)
+  if (!['draft', 'paused', 'done'].includes(campaign.status)) return errorResponse('Only a draft, paused or finished campaign can be launched.', 409, origin)
   if (!campaign.sender_id) return errorResponse('Choose a sender before launching.', 409, origin)
   if (!['gmail_oauth', 'outlook_oauth'].includes(campaign.sender_type)) {
     return errorResponse('Connect a reply-monitored Gmail or Microsoft mailbox before launching.', 409, origin)
@@ -845,10 +856,13 @@ async function campaignActionResponse(request, env, campaignId, action, session,
   const leads = await campaignEligibleLeads(env, campaign)
   if (!leads.length) return errorResponse('No eligible leads are available in this list.', 409, origin)
   const now = Date.now()
+  const relaunched = campaign.status !== 'draft'
   await queueCampaignSends(env, campaign, now)
-  await env.DB.prepare('UPDATE campaigns SET status = ? WHERE id = ? AND status = ?').bind('active', campaignId, 'draft').run()
-  await logActivity(env, campaign.workspace_id, 'campaign_launched', `Campaign "${campaign.name ?? 'Untitled'}" launched to ${leads.length} recipients.`)
-  return jsonResponse({ id: campaignId, status: 'active', queued: leads.length }, origin)
+  await env.DB.prepare("UPDATE campaigns SET status = ? WHERE id = ? AND status IN ('draft', 'paused', 'done')").bind('active', campaignId).run()
+  const queuedRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM sends WHERE campaign_id = ? AND sequence_step = 1 AND status = 'queued'").bind(campaignId).first()
+  const queued = Number(queuedRow?.n ?? 0)
+  await logActivity(env, campaign.workspace_id, 'campaign_launched', `Campaign "${campaign.name ?? 'Untitled'}" ${relaunched ? 're-launched' : 'launched'} to ${queued} recipients.`)
+  return jsonResponse({ id: campaignId, status: 'active', queued }, origin)
 }
 
 async function listLeads(env, url, session, origin) {
@@ -1745,6 +1759,46 @@ async function unarchiveCampaign(env, campaignId, session, origin) {
   await env.DB.prepare('UPDATE campaigns SET status = ? WHERE id = ?').bind(status, campaignId).run()
   await logActivity(env, campaign.workspace_id, 'campaign_unarchived', `Campaign "${campaign.name}" was restored.`)
   return jsonResponse({ id: campaignId, status }, origin)
+}
+
+async function setCampaignWorkflow(request, env, campaignId, session, origin) {
+  const body = await readJson(request)
+  if (!isObject(body) || !('workflowId' in body)) return errorResponse('Choose a valid workflow.', 400, origin)
+  const workflowId = typeof body.workflowId === 'string' && body.workflowId.trim() ? body.workflowId.trim() : null
+  if (body.workflowId !== null && body.workflowId !== '' && workflowId === null) {
+    return errorResponse('Choose a valid workflow.', 400, origin)
+  }
+  const campaign = await ownerCampaign(env, campaignId, session, null)
+  if (!campaign) return errorResponse('Campaign not found.', 404, origin)
+  if (workflowId) {
+    const workflow = await env.DB.prepare(
+      'SELECT id FROM workflows WHERE id = ? AND workspace_id = ?',
+    ).bind(workflowId, campaign.workspace_id).first()
+    if (!workflow) return errorResponse('Workflow not found in this workspace.', 400, origin)
+  }
+  await env.DB.prepare('UPDATE campaigns SET workflow_id = ? WHERE id = ?').bind(workflowId, campaignId).run()
+  await logActivity(env, campaign.workspace_id, 'campaign_workflow', `Campaign "${campaign.name}" algorithm was updated.`)
+  return jsonResponse({ id: campaignId, workflow_id: workflowId }, origin)
+}
+
+async function deleteCampaign(env, campaignId, session, origin) {
+  const campaign = await ownerCampaign(env, campaignId, session, null)
+  if (!campaign) return errorResponse('Campaign not found.', 404, origin)
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM events WHERE send_id IN (SELECT id FROM sends WHERE campaign_id = ?)').bind(campaignId),
+    env.DB.prepare('DELETE FROM inbox_replies WHERE reply_id IN (SELECT id FROM replies WHERE send_id IN (SELECT id FROM sends WHERE campaign_id = ?))').bind(campaignId),
+    env.DB.prepare('DELETE FROM replies WHERE send_id IN (SELECT id FROM sends WHERE campaign_id = ?)').bind(campaignId),
+    env.DB.prepare('DELETE FROM branch_executions WHERE send_id IN (SELECT id FROM sends WHERE campaign_id = ?) OR branch_id IN (SELECT b.id FROM branches b JOIN sequences s ON s.id = b.sequence_id WHERE s.campaign_id = ?)').bind(campaignId, campaignId),
+    env.DB.prepare('DELETE FROM workflow_executions WHERE send_id IN (SELECT id FROM sends WHERE campaign_id = ?)').bind(campaignId),
+    env.DB.prepare('DELETE FROM ab_variants WHERE ab_test_id IN (SELECT id FROM ab_tests WHERE campaign_id = ?)').bind(campaignId),
+    env.DB.prepare('DELETE FROM ab_tests WHERE campaign_id = ?').bind(campaignId),
+    env.DB.prepare('DELETE FROM branches WHERE sequence_id IN (SELECT id FROM sequences WHERE campaign_id = ?)').bind(campaignId),
+    env.DB.prepare('DELETE FROM sends WHERE campaign_id = ?').bind(campaignId),
+    env.DB.prepare('DELETE FROM sequences WHERE campaign_id = ?').bind(campaignId),
+    env.DB.prepare('DELETE FROM campaigns WHERE id = ?').bind(campaignId),
+  ])
+  await logActivity(env, campaign.workspace_id, 'campaign_deleted', `Campaign "${campaign.name}" was deleted.`)
+  return jsonResponse({ id: campaignId }, origin)
 }
 
 function csvEscape(value) {
@@ -4036,13 +4090,18 @@ async function deleteWorkflow(env, workflowId, session, origin) {
 }
 
 async function evaluateWorkflowRules(env, send, trigger, at, replyBody) {
-  const workspaceId = send.workspace_id ?? (await env.DB.prepare(
-    'SELECT workspace_id FROM campaigns WHERE id = ?',
-  ).bind(send.campaign_id).first())?.workspace_id
+  const campaign = await env.DB.prepare(
+    'SELECT workspace_id, workflow_id FROM campaigns WHERE id = ?',
+  ).bind(send.campaign_id).first()
+  const workspaceId = send.workspace_id ?? campaign?.workspace_id
   if (!workspaceId) return
-  const workflows = await env.DB.prepare(
-    'SELECT id, name, rules_json FROM workflows WHERE workspace_id = ? AND is_active = 1 ORDER BY created_at',
-  ).bind(workspaceId).all()
+  const workflows = campaign?.workflow_id
+    ? await env.DB.prepare(
+      'SELECT id, name, rules_json FROM workflows WHERE id = ? AND workspace_id = ? AND is_active = 1',
+    ).bind(campaign.workflow_id, workspaceId).all()
+    : await env.DB.prepare(
+      'SELECT id, name, rules_json FROM workflows WHERE workspace_id = ? AND is_active = 1 ORDER BY created_at',
+    ).bind(workspaceId).all()
   for (const workflow of workflows.results ?? []) {
     let rules = []
     try {
