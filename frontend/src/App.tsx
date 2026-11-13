@@ -139,7 +139,7 @@ async function apiRequest<T>(
 
 function accountUrl(mode: 'login' | 'signup', returnTo: string) {
   const target = new URL(`/${mode}/`, ACCOUNT_BASE)
-  target.searchParams.set('return', returnTo)
+  target.searchParams.set('next', returnTo)
   return target.toString()
 }
 
@@ -536,6 +536,13 @@ function LoginPage() {
   const requestedNext = params.get('next')
   const nextPath = requestedNext?.startsWith('/dashboard/') ? requestedNext : '/dashboard/'
   const returnTo = `${window.location.origin}${nextPath}`
+  useEffect(() => {
+    let live = true
+    fetchAccountSession().then((session) => {
+      if (live && session.authenticated && session.csrfToken) window.location.assign(nextPath)
+    }).catch(() => {})
+    return () => { live = false }
+  }, [nextPath])
   return <main className="auth-page"><section className="auth-card"><img className="auth-mark-img" src="/brand/kluzar-logo.png" alt="Kluzar" /><p className="eyebrow">Welcome to Kluzar Outreach</p><h1>Sign in to continue.</h1><p>Use your Kluzar Account to open your outreach workspace.</p><a className="button button-primary auth-button" href={accountUrl('login', returnTo)}>Continue to log in <span aria-hidden="true">→</span></a><p className="auth-subtext">New to Kluzar? <a href={accountUrl('signup', returnTo)}>Create an account</a></p><a className="back-link" href="/">Back to home</a></section></main>
 }
 
