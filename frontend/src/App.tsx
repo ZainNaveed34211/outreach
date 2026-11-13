@@ -14,7 +14,7 @@ type Workspace = { id: string; name: string }
 type ApiResult<T> = { data?: T; error?: string; csrfToken?: string }
 type Campaign = { id: string; name: string; status: string; lead_list_id: string; sender_id?: string | null; scheduled_at?: number | null; workflow_id?: string | null; workflow_name?: string | null }
 type Lead = { id: string; email: string; first_name?: string; company?: string; status: string }
-type LeadList = { id: string; name: string; lead_count: number }
+type LeadList = { id: string; name: string; lead_count: number; created_at: number }
 type Sender = { id: string; type: string; address: string; display_name: string; is_default: number; created_at: number }
 type Reply = { id: string; sender_email: string; subject: string; body_text: string; received_at: number; read_at?: number | null; lead_email: string; lead_id?: string; campaign_id?: string }
 type SequenceStep = { id: string; campaign_id: string; step_no: number; subject: string; delay_days: number; body_html?: string | null; template_id?: string | null }
@@ -739,6 +739,7 @@ function DashboardPage({ path }: { path: string }) {
   const [leadFirstName, setLeadFirstName] = useState('')
   const [leadCompany, setLeadCompany] = useState('')
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [pasteText, setPasteText] = useState('')
   const [campaignName, setCampaignName] = useState('')
   const [campaignSubject, setCampaignSubject] = useState('')
   const [campaignBody, setCampaignBody] = useState('')
@@ -1037,6 +1038,7 @@ function DashboardPage({ path }: { path: string }) {
       if (campaignSort !== 'created_desc') params.set('sort', campaignSort)
     }
     if (section === 'leads') {
+      if (selectedListId) params.set('listId', selectedListId)
       if (leadQuery.trim()) params.set('q', leadQuery.trim())
       if (leadStatus) params.set('status', leadStatus)
       if (leadSort !== 'created_desc') params.set('sort', leadSort)
@@ -1057,7 +1059,7 @@ function DashboardPage({ path }: { path: string }) {
       if (active) setError(cause instanceof Error ? cause.message : 'Could not load this section.')
     })
     return () => { active = false }
-  }, [endpoint, workspaceId, path, csrfToken, campaignQuery, campaignStatus, campaignSort, leadQuery, leadStatus, leadSort, inboxCampaignFilter, inboxReadFilter])
+  }, [endpoint, workspaceId, path, csrfToken, campaignQuery, campaignStatus, campaignSort, selectedListId, leadQuery, leadStatus, leadSort, inboxCampaignFilter, inboxReadFilter])
 
   useEffect(() => {
     if (!workspaceId || (section !== 'inbox' && section !== 'settings' && section !== 'templates')) return
@@ -1148,6 +1150,7 @@ function DashboardPage({ path }: { path: string }) {
       if (campaignSort !== 'created_desc') params.set('sort', campaignSort)
     }
     if (section === 'leads') {
+      if (selectedListId) params.set('listId', selectedListId)
       if (leadQuery.trim()) params.set('q', leadQuery.trim())
       if (leadStatus) params.set('status', leadStatus)
       if (leadSort !== 'created_desc') params.set('sort', leadSort)
@@ -1158,6 +1161,11 @@ function DashboardPage({ path }: { path: string }) {
     }
     const result = await request<(Campaign | Lead | Reply | SequenceStep | Sender)[]>(`${endpoint}?${params.toString()}`)
     setRecords(result)
+  }
+
+  const loadLists = async () => {
+    const rows = await request<LeadList[]>(`/lists?workspaceId=${encodeURIComponent(workspaceId)}`)
+    setLists(rows)
   }
 
   const saveTemplate = async (draft: EmailTemplateDraft) => {
@@ -1298,6 +1306,30 @@ function DashboardPage({ path }: { path: string }) {
       await refreshRecords()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'CSV import could not be completed.')
+    } finally {
+      setFormBusy(false)
+    }
+  }
+
+  const pasteLeads = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!pasteText.trim()) {
+      setError('Paste at least one email address first.')
+      return
+    }
+    setFormBusy(true)
+    setError('')
+    try {
+      const result = await request<{ added: number; duplicates: number; invalid: number; suppressed: number }>(`/lists/${encodeURIComponent(selectedListId)}/leads/paste`, {
+        method: 'POST',
+        body: JSON.stringify({ workspaceId, text: pasteText }),
+      })
+      setPasteText('')
+      setNotice(`${result.added} leads added — ${result.duplicates} duplicates skipped, ${result.invalid} invalid addresses skipped, ${result.suppressed} suppressed addresses skipped.`)
+      await refreshRecords()
+      await loadLists()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Leads could not be added.')
     } finally {
       setFormBusy(false)
     }
@@ -1730,6 +1762,65 @@ function DashboardPage({ path }: { path: string }) {
     }
   }
 
+  const deleteLead = async (leadId: string) => {
+    if (deleteConfirmId !== leadId) {
+      setDeleteConfirmId(leadId)
+      return
+    }
+    setDeleteConfirmId(null)
+    setError('')
+    try {
+      await request(`/leads/${encodeURIComponent(leadId)}`, { method: 'DELETE' })
+      setSelectedLeadIds((current) => current.filter((id) => id !== leadId))
+      setNotice('Lead deleted.')
+      await refreshRecords()
+      await loadLists()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Lead could not be deleted.')
+    }
+  }
+
+  const bulkDeleteLeads = async () => {
+    if (!selectedLeadIds.length) {
+      setError('Select at least one lead first.')
+      return
+    }
+    if (deleteConfirmId !== 'bulk-leads') {
+      setDeleteConfirmId('bulk-leads')
+      return
+    }
+    setDeleteConfirmId(null)
+    setError('')
+    try {
+      const result = await request<{ deleted: number }>('/leads/bulk', {
+        method: 'DELETE',
+        body: JSON.stringify({ workspaceId, leadIds: selectedLeadIds }),
+      })
+      setNotice(`${result.deleted} leads deleted.`)
+      setSelectedLeadIds([])
+      await refreshRecords()
+      await loadLists()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Leads could not be deleted.')
+    }
+  }
+
+  const deleteLeadList = async (listId: string) => {
+    if (deleteConfirmId !== listId) {
+      setDeleteConfirmId(listId)
+      return
+    }
+    setDeleteConfirmId(null)
+    setError('')
+    try {
+      await request(`/lists/${encodeURIComponent(listId)}`, { method: 'DELETE' })
+      setNotice('Lead list deleted.')
+      await loadLists()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Lead list could not be deleted.')
+    }
+  }
+
   const toggleSelectLead = (leadId: string) => {
     setSelectedLeadIds((current) => current.includes(leadId) ? current.filter((id) => id !== leadId) : [...current, leadId])
   }
@@ -1875,14 +1966,15 @@ function DashboardPage({ path }: { path: string }) {
               {records.filter((record): record is Campaign => 'name' in record && 'status' in record && 'lead_list_id' in record).length ? <div className="campaign-list">{records.filter((record): record is Campaign => 'name' in record && 'status' in record && 'lead_list_id' in record).map((campaign) => <article className="campaign-row" key={campaign.id}><div><strong>{campaign.name}</strong><span>{campaign.status}{campaign.scheduled_at ? ` · scheduled ${new Date(campaign.scheduled_at).toLocaleString()}` : ''} · {lists.find((list) => list.id === campaign.lead_list_id)?.name ?? 'Lead list'}</span><span>Algorithm: {campaign.workflow_name ?? 'No algorithm'}</span>{stats[campaign.id] && <small>{Object.entries(stats[campaign.id]).map(([key, value]) => `${key}: ${value}`).join(' · ') || 'No events recorded'}</small>}</div><div className="row-actions"><button className="text-button" onClick={() => showCampaignStats(campaign.id)}>View stats</button><button className="text-button" onClick={() => openPreview(campaign)}>Preview</button><button className="text-button" onClick={() => openPrelaunch(campaign)}>Check before launch</button><button className="text-button" onClick={() => cloneCampaign(campaign.id)}>Duplicate</button><button className="text-button" onClick={() => exportCampaignStatsCsv(campaign)}>Export stats</button>{campaign.status === 'archived' ? <button className="text-button" onClick={() => unarchiveCampaign(campaign.id)}>Restore</button> : <button className="text-button" onClick={() => archiveCampaign(campaign.id)}>Archive</button>}<button className="text-button" onClick={() => deleteCampaign(campaign.id)}>{deleteConfirmId === campaign.id ? 'Confirm delete?' : 'Delete'}</button><label className="launch-confirm">Algorithm <select aria-label={`Algorithm for ${campaign.name}`} value={campaign.workflow_id ?? ''} disabled={formBusy} onChange={(event) => setCampaignWorkflow(campaign.id, event.target.value || null)}><option value="">No algorithm</option>{workflows.map((workflow) => <option value={workflow.id} key={workflow.id}>{workflow.name}</option>)}</select></label>{campaign.status === 'scheduled' && <button className="text-button" onClick={() => cancelSchedule(campaign)}>Cancel schedule</button>}{(campaign.status === 'draft' || campaign.status === 'paused' || campaign.status === 'done') && <><label className="launch-confirm"><input type="checkbox" checked={launchConfirmation === campaign.id} onChange={(event) => setLaunchConfirmation(event.target.checked ? campaign.id : '')} /> I have permission to contact this list</label><button className="button button-primary button-small" disabled={formBusy || launchConfirmation !== campaign.id} onClick={() => launchCampaign(campaign.id)}>{campaign.status === 'draft' ? 'Launch' : 'Re-launch'}</button></>}</div></article>)}</div> : <div className="table-empty"><span className="empty-icon">↗</span><h3>No campaigns yet</h3><p>Create a draft after connecting a mailbox and adding a lead list. A campaign needs a lead list, a reply-monitored sender, and a first message — then test it to your own email before launch.</p><p className="muted-copy">Drafts are free to create and change. Launching queues recipients for paced sending, with suppression checked before every send.</p></div>}</section>
           </>}
           {workspaces.length > 0 && section === 'leads' && <>
-            <section className="table-panel"><div className="table-panel-header"><div><h2>Lead lists</h2><p>Organise contacts you are authorised to contact. Only import lists you have permission to use — purchased or scraped lists do not belong here.</p></div><div className="row-actions"><button className="button button-outline button-small" onClick={() => setShowListForm((value) => !value)}>New list</button><button className="button button-primary button-small" onClick={() => setShowLeadForm((value) => !value)}>Add lead</button></div></div>
+            <section className="table-panel"><div className="table-panel-header"><div><h2>Lead lists</h2><p>Organise contacts you are authorised to contact. Only import lists you have permission to use — purchased or scraped lists do not belong here.</p></div><div className="row-actions"><button className="button button-outline button-small" onClick={() => setShowListForm((value) => !value)}>New list</button><button className="button button-primary button-small" onClick={() => setShowLeadForm((value) => !value)}>Add lead</button><a className="button button-outline button-small" href="/dashboard/leads/import/">Import / paste</a></div></div>
               {showListForm && <form className="inline-form" onSubmit={createList}><label htmlFor="new-list-name">List name</label><input id="new-list-name" value={newListName} onChange={(event) => setNewListName(event.target.value)} maxLength={100} required /><button className="button button-primary button-small" disabled={formBusy}>Create list</button></form>}
               {showLeadForm && <form className="form-grid" onSubmit={createLead}><label htmlFor="lead-list">List<select id="lead-list" value={selectedListId} onChange={(event) => setSelectedListId(event.target.value)} required>{lists.map((list) => <option value={list.id} key={list.id}>{list.name}</option>)}</select></label><label htmlFor="lead-email">Email<input id="lead-email" type="email" autoComplete="off" value={leadEmail} onChange={(event) => setLeadEmail(event.target.value)} maxLength={254} required /></label><label htmlFor="lead-first-name">First name<input id="lead-first-name" value={leadFirstName} onChange={(event) => setLeadFirstName(event.target.value)} maxLength={100} /></label><label htmlFor="lead-company">Company<input id="lead-company" value={leadCompany} onChange={(event) => setLeadCompany(event.target.value)} maxLength={150} /></label><button className="button button-primary button-small" disabled={formBusy}>Add lead</button></form>}
-              {path.includes('/import/') && <form className="form-panel csv-form" onSubmit={importCsv}><h3>Import a CSV</h3><p className="form-hint">The file is validated server-side. The email column is required; first_name and company are optional. Maximum file size: 5 MB.</p><label htmlFor="csv-list">Add contacts to</label><select id="csv-list" value={selectedListId} onChange={(event) => setSelectedListId(event.target.value)} required>{lists.map((list) => <option value={list.id} key={list.id}>{list.name}</option>)}</select><label htmlFor="csv-file">CSV file</label><input id="csv-file" type="file" accept=".csv,text/csv" onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)} required /><button className="button button-primary button-small" disabled={formBusy}>{formBusy ? 'Importing…' : 'Import contacts'}</button></form>}
-              {lists.length > 0 && <div className="list-chips">{lists.map((list) => <button className={selectedListId === list.id ? 'list-chip active' : 'list-chip'} key={list.id} onClick={() => setSelectedListId(list.id)}>{list.name}<span>{list.lead_count}</span></button>)}</div>}
-              <div className="filter-bar"><input aria-label="Search leads" type="search" placeholder="Search name, email or company…" value={leadQuery} onChange={(event) => setLeadQuery(event.target.value)} /><select aria-label="Filter leads by status" value={leadStatus} onChange={(event) => setLeadStatus(event.target.value)}><option value="">All statuses</option>{['new', 'contacted', 'replied', 'interested', 'not_interested', 'bounced', 'unsubscribed'].map((status) => <option value={status} key={status}>{status.replaceAll('_', ' ')}</option>)}</select><select aria-label="Sort leads" value={leadSort} onChange={(event) => setLeadSort(event.target.value)}><option value="created_desc">Newest first</option><option value="created_asc">Oldest first</option><option value="email_asc">Email A–Z</option><option value="email_desc">Email Z–A</option></select>{lists.find((list) => list.id === selectedListId) && <button className="button button-outline button-small" onClick={() => exportListCsv(lists.find((list) => list.id === selectedListId)!)}>Export list CSV</button>}</div>
-              {selectedLeadIds.length > 0 && <div className="bulk-bar"><span>{selectedLeadIds.length} selected</span><select aria-label="Bulk status" value={bulkStatus} onChange={(event) => setBulkStatus(event.target.value)}>{['new', 'contacted', 'replied', 'interested', 'not_interested', 'bounced', 'unsubscribed'].map((status) => <option value={status} key={status}>{status.replaceAll('_', ' ')}</option>)}</select><button className="button button-primary button-small" onClick={() => void bulkUpdateLeads()}>Apply status</button><button className="text-button" onClick={() => setSelectedLeadIds([])}>Clear selection</button></div>}
-              {records.filter((record): record is Lead => 'email' in record && 'status' in record).length ? <div className="data-list"><div className="lead-row lead-row-header"><input type="checkbox" aria-label="Select all leads shown" checked={records.filter((record): record is Lead => 'email' in record && 'status' in record).length > 0 && selectedLeadIds.length === records.filter((record): record is Lead => 'email' in record && 'status' in record).length} onChange={() => toggleSelectAllLeads(records.filter((record): record is Lead => 'email' in record && 'status' in record))} /><div><strong>Lead</strong></div><span>Status</span></div>{records.filter((record): record is Lead => 'email' in record && 'status' in record).map((lead) => <div className="lead-row" key={lead.id}><input type="checkbox" aria-label={`Select ${lead.email}`} checked={selectedLeadIds.includes(lead.id)} onChange={() => toggleSelectLead(lead.id)} /><div><button className="text-button lead-email-button" onClick={() => openLeadTimeline(lead)}>{lead.email}</button><span>{[lead.first_name, lead.company].filter(Boolean).join(' · ')}</span></div><select aria-label={`Status for ${lead.email}`} value={lead.status} onChange={(event) => updateLeadStatus(lead.id, event.target.value)}>{['new', 'contacted', 'replied', 'interested', 'not_interested', 'bounced', 'unsubscribed'].map((status) => <option value={status} key={status}>{status.replaceAll('_', ' ')}</option>)}</select></div>)}</div> : <div className="table-empty"><span className="empty-icon">◎</span><h3>No leads yet</h3><p>Add contacts manually or import a CSV into a list. The CSV needs an email column; first name and company are optional. Invalid and duplicate addresses are rejected, and suppressed addresses stay suppressed.</p><p className="muted-copy">Change a lead\u2019s status any time — marking someone unsubscribed stops future sends to them.</p><a className="button button-outline button-small" href="/dashboard/leads/import/">Import CSV</a></div>}
+              {path.includes('/import/') && <><form className="form-panel csv-form" onSubmit={importCsv}><h3>Import a CSV</h3><p className="form-hint">The file is validated server-side. The email column is required; first_name and company are optional. Maximum file size: 5 MB.</p><label htmlFor="csv-list">Add contacts to</label><select id="csv-list" value={selectedListId} onChange={(event) => setSelectedListId(event.target.value)} required>{lists.map((list) => <option value={list.id} key={list.id}>{list.name}</option>)}</select><label htmlFor="csv-file">CSV file</label><input id="csv-file" type="file" accept=".csv,text/csv" onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)} required /><button className="button button-primary button-small" disabled={formBusy}>{formBusy ? 'Importing…' : 'Import contacts'}</button></form><form className="form-panel paste-form" onSubmit={pasteLeads}><h3>Paste emails</h3><p className="form-hint">One email per line — commas and semicolons work too. Addresses are validated server-side; duplicates and suppressed addresses are skipped. Up to 1000 addresses at a time.</p><label htmlFor="paste-list">Add leads to</label><select id="paste-list" value={selectedListId} onChange={(event) => setSelectedListId(event.target.value)} required>{lists.map((list) => <option value={list.id} key={list.id}>{list.name}</option>)}</select><label htmlFor="paste-emails">Email addresses</label><textarea id="paste-emails" value={pasteText} onChange={(event) => setPasteText(event.target.value)} maxLength={30000} rows={6} placeholder={'ada@example.com\nbo@example.com'} required /><button className="button button-primary button-small" disabled={formBusy}>{formBusy ? 'Adding…' : 'Add leads'}</button></form></>}
+              {lists.length > 0 && <div className="group-list">{lists.map((list) => <article className={selectedListId === list.id ? 'group-card active' : 'group-card'} key={list.id} onClick={() => { setSelectedListId(list.id); setSelectedLeadIds([]) }}><div><strong>{list.name}</strong><span>{list.lead_count} {list.lead_count === 1 ? 'lead' : 'leads'} · Created {new Date(list.created_at).toLocaleDateString()}</span></div><div className="row-actions"><button className="text-button" onClick={(event) => { event.stopPropagation(); exportListCsv(list) }}>Export CSV</button><button className="text-button" onClick={(event) => { event.stopPropagation(); void deleteLeadList(list.id) }}>{deleteConfirmId === list.id ? 'Confirm delete?' : 'Delete'}</button></div></article>)}</div>}
+              {lists.find((list) => list.id === selectedListId) && <p className="group-open">Showing only leads in “{lists.find((list) => list.id === selectedListId)!.name}”. Select another group above to see its leads.</p>}
+              <div className="filter-bar"><input aria-label="Search leads" type="search" placeholder="Search name, email or company…" value={leadQuery} onChange={(event) => setLeadQuery(event.target.value)} /><select aria-label="Filter leads by status" value={leadStatus} onChange={(event) => setLeadStatus(event.target.value)}><option value="">All statuses</option>{['new', 'contacted', 'replied', 'interested', 'not_interested', 'bounced', 'unsubscribed'].map((status) => <option value={status} key={status}>{status.replaceAll('_', ' ')}</option>)}</select><select aria-label="Sort leads" value={leadSort} onChange={(event) => setLeadSort(event.target.value)}><option value="created_desc">Newest first</option><option value="created_asc">Oldest first</option><option value="email_asc">Email A–Z</option><option value="email_desc">Email Z–A</option></select></div>
+              {selectedLeadIds.length > 0 && <div className="bulk-bar"><span>{selectedLeadIds.length} selected</span><select aria-label="Bulk status" value={bulkStatus} onChange={(event) => setBulkStatus(event.target.value)}>{['new', 'contacted', 'replied', 'interested', 'not_interested', 'bounced', 'unsubscribed'].map((status) => <option value={status} key={status}>{status.replaceAll('_', ' ')}</option>)}</select><button className="button button-primary button-small" onClick={() => void bulkUpdateLeads()}>Apply status</button><button className="text-button" onClick={() => void bulkDeleteLeads()}>{deleteConfirmId === 'bulk-leads' ? 'Confirm delete?' : 'Delete selected'}</button><button className="text-button" onClick={() => setSelectedLeadIds([])}>Clear selection</button></div>}
+              {records.filter((record): record is Lead => 'email' in record && 'status' in record).length ? <div className="data-list"><div className="lead-row lead-row-header"><input type="checkbox" aria-label="Select all leads shown" checked={records.filter((record): record is Lead => 'email' in record && 'status' in record).length > 0 && selectedLeadIds.length === records.filter((record): record is Lead => 'email' in record && 'status' in record).length} onChange={() => toggleSelectAllLeads(records.filter((record): record is Lead => 'email' in record && 'status' in record))} /><div><strong>Lead</strong></div><span>Status</span></div>{records.filter((record): record is Lead => 'email' in record && 'status' in record).map((lead) => <div className="lead-row" key={lead.id}><input type="checkbox" aria-label={`Select ${lead.email}`} checked={selectedLeadIds.includes(lead.id)} onChange={() => toggleSelectLead(lead.id)} /><div><button className="text-button lead-email-button" onClick={() => openLeadTimeline(lead)}>{lead.email}</button><span>{[lead.first_name, lead.company].filter(Boolean).join(' · ')}</span></div><select aria-label={`Status for ${lead.email}`} value={lead.status} onChange={(event) => updateLeadStatus(lead.id, event.target.value)}>{['new', 'contacted', 'replied', 'interested', 'not_interested', 'bounced', 'unsubscribed'].map((status) => <option value={status} key={status}>{status.replaceAll('_', ' ')}</option>)}</select><button className="text-button" onClick={() => void deleteLead(lead.id)}>{deleteConfirmId === lead.id ? 'Confirm delete?' : 'Delete'}</button></div>)}</div> : <div className="table-empty"><span className="empty-icon">◎</span><h3>No leads yet</h3><p>Add contacts manually, paste emails, or import a CSV into a list. The CSV needs an email column; first name and company are optional. Invalid and duplicate addresses are rejected, and suppressed addresses stay suppressed.</p><p className="muted-copy">Change a lead\u2019s status any time — marking someone unsubscribed stops future sends to them.</p><a className="button button-outline button-small" href="/dashboard/leads/import/">Import or paste emails</a></div>}
             </section>
             {timeline && <section className="table-panel"><div className="table-panel-header"><div><h2>Activity — {timeline.lead.email}</h2><p>Every recorded event for this lead, from import to reply.</p></div><button className="text-button" onClick={() => setTimeline(null)}>Close timeline</button></div><ol className="timeline-list">{timeline.timeline.map((event, index) => <li key={`${event.type}-${event.at}-${index}`}><span>{new Date(event.at).toLocaleString()}</span><div><strong>{event.type.replaceAll('_', ' ')}</strong>{event.campaign_name && <p>{event.campaign_name}{event.sequence_step ? ` · step ${event.sequence_step}` : ''}</p>}</div></li>)}</ol></section>}
             <section className="table-panel"><div className="table-panel-header"><div><h2>Suppression manager</h2><p>Suppressed addresses never receive outreach. Add an address here, or remove one to allow contact again.</p></div></div>

@@ -583,10 +583,12 @@ async function routeApi(request, env, ctx, url, session, origin) {
   const importComplete = path.match(/^\/v1\/leads\/import\/([A-Za-z0-9_-]+)\/complete$/)
   if (importComplete && method === 'POST') return completeUpload(env, importComplete[1], session, origin, 'csv_import')
   if (path === '/v1/leads/bulk' && method === 'PATCH') return bulkUpdateLeads(request, env, session, origin)
+  if (path === '/v1/leads/bulk' && method === 'DELETE') return bulkDeleteLeads(request, env, session, origin)
   const leadTimelineMatch = path.match(/^\/v1\/leads\/([A-Za-z0-9_-]+)\/timeline$/)
   if (leadTimelineMatch && method === 'GET') return leadTimeline(env, leadTimelineMatch[1], url, session, origin)
   const leadMatch = path.match(/^\/v1\/leads\/([A-Za-z0-9_-]+)$/)
   if (leadMatch && method === 'PATCH') return updateLead(request, env, leadMatch[1], session, origin)
+  if (leadMatch && method === 'DELETE') return deleteLead(env, leadMatch[1], session, origin)
   if (path === '/v1/sequences' && method === 'GET') return listSequences(env, url, session, origin)
   if (path === '/v1/sequences' && method === 'POST') return createSequence(request, env, session, origin)
   const sequenceMatch = path.match(/^\/v1\/sequences\/([A-Za-z0-9_-]+)$/)
@@ -619,6 +621,10 @@ async function routeApi(request, env, ctx, url, session, origin) {
   if (preferencesMatch && method === 'PATCH') return updatePreferences(request, env, preferencesMatch[1], session, origin)
   const listExportMatch = path.match(/^\/v1\/lists\/([A-Za-z0-9_-]+)\/export$/)
   if (listExportMatch && method === 'GET') return exportLeadList(env, listExportMatch[1], url, session)
+  const listMatch = path.match(/^\/v1\/lists\/([A-Za-z0-9_-]+)$/)
+  if (listMatch && method === 'DELETE') return deleteLeadList(env, listMatch[1], session, origin)
+  const pasteMatch = path.match(/^\/v1\/lists\/([A-Za-z0-9_-]+)\/leads\/paste$/)
+  if (pasteMatch && method === 'POST') return pasteLeads(request, env, pasteMatch[1], session, origin)
   const campaignPreviewMatch = path.match(/^\/v1\/campaigns\/([A-Za-z0-9_-]+)\/preview$/)
   if (campaignPreviewMatch && method === 'GET') return previewCampaign(env, campaignPreviewMatch[1], url, session, origin)
   const campaignPrelaunchMatch = path.match(/^\/v1\/campaigns\/([A-Za-z0-9_-]+)\/prelaunch$/)
@@ -1911,6 +1917,159 @@ async function bulkUpdateLeads(request, env, session, origin) {
     if (statements.length) await env.DB.batch(statements)
   }
   return jsonResponse({ updated: changed }, origin)
+}
+
+function leadDeleteStatements(env, leadIds) {
+  const placeholders = leadIds.map(() => '?').join(',')
+  return [
+    env.DB.prepare(`DELETE FROM events WHERE send_id IN (SELECT id FROM sends WHERE lead_id IN (${placeholders}))`).bind(...leadIds),
+    env.DB.prepare(`DELETE FROM inbox_replies WHERE reply_id IN (SELECT id FROM replies WHERE send_id IN (SELECT id FROM sends WHERE lead_id IN (${placeholders})))`).bind(...leadIds),
+    env.DB.prepare(`DELETE FROM replies WHERE send_id IN (SELECT id FROM sends WHERE lead_id IN (${placeholders}))`).bind(...leadIds),
+    env.DB.prepare(`DELETE FROM branch_executions WHERE send_id IN (SELECT id FROM sends WHERE lead_id IN (${placeholders}))`).bind(...leadIds),
+    env.DB.prepare(`DELETE FROM workflow_executions WHERE send_id IN (SELECT id FROM sends WHERE lead_id IN (${placeholders}))`).bind(...leadIds),
+    env.DB.prepare(`DELETE FROM sends WHERE lead_id IN (${placeholders})`).bind(...leadIds),
+    env.DB.prepare(`DELETE FROM lead_list_members WHERE lead_id IN (${placeholders})`).bind(...leadIds),
+    env.DB.prepare(`DELETE FROM unsubscribe_tokens WHERE lead_id IN (${placeholders})`).bind(...leadIds),
+    env.DB.prepare(`DELETE FROM leads WHERE id IN (${placeholders})`).bind(...leadIds),
+  ]
+}
+
+async function deleteLead(env, leadId, session, origin) {
+  const lead = await env.DB.prepare(
+    `SELECT l.id, l.workspace_id, l.email FROM leads l JOIN workspaces w ON w.id = l.workspace_id
+     WHERE l.id = ? AND w.owner_user_id = ?`,
+  ).bind(leadId, session.userId).first()
+  if (!lead) return errorResponse('Lead not found.', 404, origin)
+  await env.DB.batch(leadDeleteStatements(env, [leadId]))
+  await logActivity(env, lead.workspace_id, 'lead_deleted', `Lead ${lead.email} was deleted.`)
+  return jsonResponse({ id: leadId }, origin)
+}
+
+async function bulkDeleteLeads(request, env, session, origin) {
+  const body = await readJson(request)
+  if (
+    !isObject(body) ||
+    !await ownsWorkspace(env, body.workspaceId, session.userId) ||
+    !Array.isArray(body.leadIds) ||
+    body.leadIds.length < 1 ||
+    body.leadIds.length > 500 ||
+    body.leadIds.some((id) => typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(id))
+  ) return errorResponse('Choose valid leads to delete.', 400, origin)
+  const results = await env.DB.batch(leadDeleteStatements(env, body.leadIds))
+  const deleted = results[results.length - 1]?.meta?.changes ?? 0
+  await logActivity(env, body.workspaceId, 'leads_deleted', `${deleted} leads were deleted.`)
+  return jsonResponse({ deleted }, origin)
+}
+
+async function deleteLeadList(env, listId, session, origin) {
+  const list = await env.DB.prepare(
+    `SELECT l.id, l.workspace_id, l.name FROM lead_lists l JOIN workspaces w ON w.id = l.workspace_id
+     WHERE l.id = ? AND w.owner_user_id = ?`,
+  ).bind(listId, session.userId).first()
+  if (!list) return errorResponse('Lead list not found.', 404, origin)
+  const used = await env.DB.prepare('SELECT id FROM campaigns WHERE lead_list_id = ? LIMIT 1').bind(listId).first()
+  if (used) return errorResponse('This list is used by a campaign.', 400, origin)
+  const memberRows = await env.DB.prepare('SELECT lead_id FROM lead_list_members WHERE list_id = ?').bind(listId).all()
+  const leadIds = (memberRows.results ?? []).map((row) => row.lead_id)
+  let exclusiveIds = leadIds
+  if (leadIds.length) {
+    const placeholders = leadIds.map(() => '?').join(',')
+    const shared = await env.DB.prepare(
+      `SELECT DISTINCT lead_id FROM lead_list_members WHERE list_id != ? AND lead_id IN (${placeholders})`,
+    ).bind(listId, ...leadIds).all()
+    const sharedIds = new Set((shared.results ?? []).map((row) => row.lead_id))
+    exclusiveIds = leadIds.filter((id) => !sharedIds.has(id))
+  }
+  const statements = []
+  if (exclusiveIds.length) statements.push(...leadDeleteStatements(env, exclusiveIds))
+  statements.push(
+    env.DB.prepare('DELETE FROM lead_list_members WHERE list_id = ?').bind(listId),
+    env.DB.prepare('DELETE FROM upload_intents WHERE list_id = ?').bind(listId),
+    env.DB.prepare('DELETE FROM lead_lists WHERE id = ?').bind(listId),
+  )
+  await env.DB.batch(statements)
+  await logActivity(env, list.workspace_id, 'lead_list_deleted', `Lead list "${list.name}" was deleted.`)
+  return jsonResponse({ id: listId, deleted_leads: exclusiveIds.length }, origin)
+}
+
+async function pasteLeads(request, env, listId, session, origin) {
+  const body = await readJson(request)
+  if (!isObject(body) || !await ownsWorkspace(env, body.workspaceId, session.userId)) {
+    return errorResponse('Choose a valid workspace and lead list.', 400, origin)
+  }
+  const list = await env.DB.prepare('SELECT id FROM lead_lists WHERE id = ? AND workspace_id = ?')
+    .bind(listId, body.workspaceId).first()
+  if (!list) return errorResponse('Lead list not found.', 404, origin)
+  const rawText = typeof body.text === 'string'
+    ? body.text
+    : Array.isArray(body.emails) ? body.emails.join('\n') : ''
+  const tokens = rawText.split(/[\s,;]+/).map((value) => value.trim()).filter(Boolean)
+  if (!tokens.length) return errorResponse('Paste at least one email address.', 400, origin)
+  if (tokens.length > 1000) return errorResponse('Paste up to 1000 email addresses at a time.', 400, origin)
+  const seen = new Set()
+  const valid = []
+  let invalid = 0
+  let duplicates = 0
+  for (const token of tokens) {
+    const email = normalizeEmail(token)
+    if (!isValidEmail(email)) { invalid += 1; continue }
+    if (seen.has(email)) { duplicates += 1; continue }
+    seen.add(email)
+    valid.push(email)
+  }
+  let suppressed = 0
+  let added = 0
+  if (valid.length) {
+    const placeholders = valid.map(() => '?').join(',')
+    const [existingRows, suppressedRows] = await Promise.all([
+      env.DB.prepare(`SELECT email FROM leads WHERE workspace_id = ? AND email IN (${placeholders})`).bind(body.workspaceId, ...valid).all(),
+      env.DB.prepare(`SELECT email FROM suppressions WHERE workspace_id = ? AND email IN (${placeholders})`).bind(body.workspaceId, ...valid).all(),
+    ])
+    const existingEmails = new Set((existingRows.results ?? []).map((row) => row.email))
+    const suppressedEmails = new Set((suppressedRows.results ?? []).map((row) => row.email))
+    const fresh = []
+    const join = []
+    for (const email of valid) {
+      if (suppressedEmails.has(email)) { suppressed += 1; continue }
+      if (existingEmails.has(email)) { duplicates += 1; join.push(email); continue }
+      fresh.push(email)
+      join.push(email)
+    }
+    for (let offset = 0; offset < join.length; offset += 100) {
+      const chunk = join.slice(offset, offset + 100)
+      const createdAt = Date.now()
+      const freshSet = new Set(fresh)
+      const newChunk = chunk.filter((email) => freshSet.has(email))
+      const leadValues = []
+      for (const email of newChunk) {
+        leadValues.push(crypto.randomUUID(), body.workspaceId, email, null, null, 'new', createdAt)
+      }
+      const memberValues = []
+      for (const email of chunk) memberValues.push(listId, body.workspaceId, email, createdAt)
+      const memberRows = chunk.map(() => '(?, ?, ?, ?)').join(', ')
+      const statements = []
+      const leadsOutcomeIndex = leadValues.length ? 0 : -1
+      if (leadValues.length) {
+        const leadRows = newChunk.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')
+        statements.push(env.DB.prepare(
+          `WITH incoming(id, workspace_id, email, first_name, company, status, created_at) AS (VALUES ${leadRows})
+           INSERT OR IGNORE INTO leads (id, workspace_id, email, first_name, company, status, created_at)
+           SELECT id, workspace_id, email, first_name, company, status, created_at FROM incoming`,
+        ).bind(...leadValues))
+      }
+      statements.push(env.DB.prepare(
+        `WITH incoming(list_id, workspace_id, email, created_at) AS (VALUES ${memberRows})
+         INSERT OR IGNORE INTO lead_list_members (list_id, lead_id, created_at)
+         SELECT incoming.list_id, leads.id, incoming.created_at
+         FROM incoming JOIN leads
+           ON leads.workspace_id = incoming.workspace_id AND leads.email = incoming.email`,
+      ).bind(...memberValues))
+      const outcomes = await env.DB.batch(statements)
+      if (leadsOutcomeIndex >= 0) added += outcomes[leadsOutcomeIndex]?.meta?.changes ?? 0
+    }
+  }
+  await logActivity(env, body.workspaceId, 'leads_imported', `${added} contacts added by pasting emails (${duplicates} duplicates skipped, ${suppressed} suppressed skipped).`)
+  return jsonResponse({ added, duplicates, invalid, suppressed }, origin, 201)
 }
 
 async function leadTimeline(env, leadId, url, session, origin) {
