@@ -613,6 +613,8 @@ async function routeApi(request, env, ctx, url, session, origin) {
   if (path === '/v1/branches' && method === 'POST') return createBranch(request, env, session, origin)
   if (path === '/v1/senders' && method === 'GET') return listSenders(env, url, session, origin)
   if (path === '/v1/senders' && method === 'POST') return createBrevoSender(request, env, session, origin)
+  const senderMatch = path.match(/^\/v1\/senders\/([A-Za-z0-9_-]+)$/)
+  if (senderMatch && method === 'DELETE') return deleteSender(env, senderMatch[1], session, origin)
   if (path === '/v1/senders/oauth' && method === 'POST') return startOAuth(request, env, session, origin)
   const oauthExchange = path.match(/^\/v1\/oauth\/(google|microsoft)\/exchange$/)
   if (oauthExchange && method === 'POST') return exchangeOAuth(request, env, oauthExchange[1], session, origin)
@@ -1414,6 +1416,33 @@ async function createBrevoSender(request, env, session, origin) {
     ).bind(id, body.workspaceId, 'brevo_default', 'hello@kluzar.com', 'Kluzar', createdAt),
   ])
   return jsonResponse({ id, workspace_id: body.workspaceId, type: 'brevo_default', address: 'hello@kluzar.com', display_name: 'Kluzar', is_default: 1, created_at: createdAt }, origin, 201)
+}
+
+async function deleteSender(env, senderId, session, origin) {
+  const sender = await env.DB.prepare(
+    'SELECT id, workspace_id, type, address, credentials_ref FROM senders WHERE id = ?',
+  ).bind(senderId).first()
+  if (!sender) return errorResponse('Sender not found.', 404, origin)
+  if (!await ownsWorkspace(env, sender.workspace_id, session.userId)) return errorResponse('Sender not found.', 404, origin)
+  if (sender.type === 'gmail_oauth' && sender.credentials_ref) {
+    try {
+      const credentials = await decryptToken(env, sender.credentials_ref)
+      if (credentials?.refreshToken) {
+        await fetch('https://oauth2.googleapis.com/revoke', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ token: credentials.refreshToken }),
+        })
+      }
+    } catch {
+    }
+  }
+  await env.DB.batch([
+    env.DB.prepare('UPDATE campaigns SET sender_id = NULL WHERE sender_id = ? AND workspace_id = ?').bind(senderId, sender.workspace_id),
+    env.DB.prepare('DELETE FROM senders WHERE id = ? AND workspace_id = ?').bind(senderId, sender.workspace_id),
+  ])
+  await logActivity(env, sender.workspace_id, 'sender_removed', `Sender ${sender.address} was removed.`)
+  return jsonResponse({ id: senderId }, origin)
 }
 
 async function listInbox(env, url, session, origin) {

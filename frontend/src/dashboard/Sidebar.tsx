@@ -22,6 +22,8 @@ const NAV_ITEMS_LIBRARY: NavItem[] = [
   { title: 'DNS setup', href: '/dashboard/dns/', icon: 'check' },
   { title: 'Deliverability & Warm-up', href: '/dashboard/warmup/', icon: 'shield' },
   { title: 'Integrations', href: '/dashboard/integrations/', icon: 'link' },
+  { title: 'Senders & domains', href: '/dashboard/senders/', icon: 'send' },
+  { title: 'Test mode', href: '/dashboard/test/', icon: 'flask' },
   { title: 'Team', href: '/dashboard/team/', icon: 'team' },
   { title: 'Settings', href: '/dashboard/settings/', icon: 'gear' },
 ]
