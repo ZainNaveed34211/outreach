@@ -232,7 +232,6 @@ function Header() {
   )
 }
 
-const INSTAGRAM_URL = 'https://www.instagram.com/kluzar.official/'
 const YOUTUBE_URL = 'https://www.youtube.com/@kluzar.official'
 
 function Footer() {
@@ -244,7 +243,6 @@ function Footer() {
           <p>Organise. Outreach. Grow.</p>
           <p>Outreach, organised around your own mailbox. Campaigns, sequences, leads and replies in one calm workspace.</p>
           <div className="footer-social">
-            <a href={INSTAGRAM_URL} target="_blank" rel="noreferrer">Instagram <span aria-hidden="true">↗</span></a>
             <a href={YOUTUBE_URL} target="_blank" rel="noreferrer">YouTube <span aria-hidden="true">↗</span></a>
           </div>
         </div>
