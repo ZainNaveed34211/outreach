@@ -926,7 +926,7 @@ function DashboardPage({ path }: { path: string }) {
         setOwnEmail(payload.data?.user?.email ?? '')
         setTestEmail(payload.data?.user?.email ?? '')
         setWorkspaces(ownWorkspaces)
-        setWorkspaceId(ownWorkspaces[0]?.id ?? '')
+        setWorkspaceId((current) => (current && ownWorkspaces.some((w) => w.id === current) ? current : ownWorkspaces[0]?.id ?? ''))
         setLoading(false)
       } catch (cause: unknown) {
         if (active) {
