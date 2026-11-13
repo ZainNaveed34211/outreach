@@ -2301,9 +2301,8 @@ async function exchangeOAuth(request, env, provider, session, origin) {
   try {
     tokenResponse = await fetch(tokenUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-      body: parameters,
-      redirect: 'error',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: parameters.toString(),
     })
   } catch {
     return errorResponse('The mailbox provider could not be reached. Please try again.', 502, origin)
@@ -2366,7 +2365,7 @@ async function googleIdentity(env, idToken, nonce) {
   const url = new URL('https://oauth2.googleapis.com/tokeninfo')
   url.searchParams.set('id_token', idToken)
   try {
-    const result = await fetch(url, { redirect: 'error' })
+    const result = await fetch(url)
     if (!result.ok) return null
     const identity = await result.json()
     if (
@@ -2395,7 +2394,6 @@ async function microsoftIdentity(env, idToken, nonce) {
     const now = Math.floor(Date.now() / 1000)
     if (claims.exp < now || claims.nbf > now || !safeText(claims.tid, 100)) return null
     const keysResponse = await fetch('https://login.microsoftonline.com/common/discovery/v2.0/keys', {
-      redirect: 'error',
     })
     if (!keysResponse.ok) return null
     const keySet = await keysResponse.json()
@@ -2442,7 +2440,6 @@ async function refreshSender(env, sender) {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
       body: new URLSearchParams(fields),
-      redirect: 'error',
     })
     if (!response.ok) return null
     refreshed = await response.json()
@@ -2504,7 +2501,6 @@ async function sendBrevo(env, message) {
         Accept: 'application/json',
       },
       body: JSON.stringify(payload),
-      redirect: 'error',
     })
     if (!response.ok) return null
     result = await response.json()
@@ -2562,7 +2558,6 @@ async function sendGmail(env, sender, credentials, message) {
       method: 'POST',
       headers: { Authorization: `Bearer ${credentials.accessToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ raw: encodeMimeBody(raw), ...(message.threadId ? { threadId: message.threadId } : {}) }),
-      redirect: 'error',
     })
     if (!response.ok) return null
     const result = await response.json()
@@ -2597,14 +2592,12 @@ async function sendMicrosoft(sender, credentials, message) {
         toRecipients: [{ emailAddress: { address: message.email } }],
         internetMessageHeaders: headers,
       }),
-      redirect: 'error',
     })
     if (!created.ok) return null
     const draft = await created.json()
     const sent = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(draft.id)}/send`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${credentials.accessToken}` },
-      redirect: 'error',
     })
     if (!sent.ok) return null
     return { messageId: draft.id, threadId: draft.conversationId ?? null }
@@ -2623,7 +2616,6 @@ async function sendMicrosoftReply(sender, credentials, message) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({}),
-      redirect: 'error',
     })
     if (!created.ok) return null
     draft = await created.json()
@@ -2638,13 +2630,11 @@ async function sendMicrosoftReply(sender, credentials, message) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ body: { contentType: 'Text', content: message.text } }),
-      redirect: 'error',
     })
     if (!updated.ok) return null
     const sent = await fetch(`https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(draft.id)}/send`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${credentials.accessToken}` },
-      redirect: 'error',
     })
     if (!sent.ok) return null
     return { messageId: draft.id, threadId: draft.conversationId ?? null }
@@ -2707,7 +2697,6 @@ async function verifyBrevoEvent(env, payload, eventInfo) {
   try {
     upstream = await fetch(url, {
       headers: { 'api-key': env.BREVO_API_KEY, Accept: 'application/json' },
-      redirect: 'error',
     })
   } catch {
     return false
@@ -2876,7 +2865,7 @@ async function findReply(env, send, now) {
     try {
       response = await fetch(
         `https://gmail.googleapis.com/gmail/v1/users/me/threads/${encodeURIComponent(send.provider_thread_id)}?format=full`,
-        { headers: { Authorization: `Bearer ${credentials.accessToken}` }, redirect: 'error' },
+        { headers: { Authorization: `Bearer ${credentials.accessToken}` } },
       )
     } catch {
       return null
@@ -2908,7 +2897,6 @@ async function findReply(env, send, now) {
         Authorization: `Bearer ${credentials.accessToken}`,
         Prefer: 'outlook.body-content-type="text"',
       },
-      redirect: 'error',
     })
   } catch {
     return null
@@ -3836,7 +3824,6 @@ async function dohTxt(name) {
   try {
     result = await fetch(url, {
       headers: { Accept: 'application/dns-json' },
-      redirect: 'error',
     })
   } catch {
     return { ok: false, records: [] }
